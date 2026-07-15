@@ -52,12 +52,10 @@ class ActorCritic(nn.Module):
         obs_dim: int,
         action_dim: int,
         critic_obs_dim: int | None = None,
-        base_obs_dim: int = 32,
-        reference_dim: int = 0,
         actor_hidden_sizes: Sequence[int] = (256, 256, 128),
         critic_hidden_sizes: Sequence[int] = (256, 256, 128),
         recurrent_hidden_size: int = 128,
-        reference_hidden_size: int = 128,
+        temporal_gate_init: float = 0.0,
         activation: str = "elu",
         init_std: float = 0.20,
     ):
@@ -67,36 +65,19 @@ class ActorCritic(nn.Module):
         self.obs_dim = int(obs_dim)
         self.action_dim = int(action_dim)
         self.critic_obs_dim = int(critic_obs_dim if critic_obs_dim is not None else obs_dim)
-        self.base_obs_dim = int(base_obs_dim)
-        self.reference_dim = int(reference_dim)
-        if self.base_obs_dim + self.reference_dim != self.obs_dim:
-            raise ValueError(
-                "base_obs_dim + reference_dim must equal obs_dim, got "
-                f"{self.base_obs_dim} + {self.reference_dim} != {self.obs_dim}"
-            )
         self.actor_hidden_sizes = tuple(int(size) for size in actor_hidden_sizes)
         self.critic_hidden_sizes = tuple(int(size) for size in critic_hidden_sizes)
         self.recurrent_hidden_size = int(recurrent_hidden_size)
-        self.reference_hidden_size = int(reference_hidden_size)
-        if self.recurrent_hidden_size <= 0 or self.reference_hidden_size <= 0:
-            raise ValueError("recurrent and reference hidden sizes must be positive")
+        if self.recurrent_hidden_size <= 0:
+            raise ValueError("recurrent hidden size must be positive")
         self.activation = str(activation)
-        self.actor_body = mlp(self.base_obs_dim, self.actor_hidden_sizes, self.activation)
+        self.actor_body = mlp(self.obs_dim, self.actor_hidden_sizes, self.activation)
         actor_latent_dim = self.actor_hidden_sizes[-1]
         self.actor_gru = nn.GRUCell(actor_latent_dim, self.recurrent_hidden_size)
         self.temporal_projection = nn.Linear(self.recurrent_hidden_size, actor_latent_dim)
-        self.temporal_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
-        if self.reference_dim > 0:
-            self.reference_encoder = mlp(
-                self.reference_dim,
-                (self.reference_hidden_size,),
-                self.activation,
-            )
-            self.reference_projection = nn.Linear(self.reference_hidden_size, actor_latent_dim)
-        else:
-            self.reference_encoder = None
-            self.reference_projection = None
-        self.reference_gate = nn.Parameter(torch.zeros((), dtype=torch.float32))
+        self.temporal_gate = nn.Parameter(
+            torch.tensor(float(temporal_gate_init), dtype=torch.float32)
+        )
         self.actor_mean = nn.Linear(actor_latent_dim, self.action_dim)
         self.critic_body = mlp(self.critic_obs_dim, self.critic_hidden_sizes, self.activation)
         self.critic = nn.Linear(self.critic_hidden_sizes[-1], 1)
@@ -105,9 +86,6 @@ class ActorCritic(nn.Module):
         nn.init.constant_(self.actor_mean.bias, 0.0)
         nn.init.orthogonal_(self.temporal_projection.weight, gain=0.01)
         nn.init.constant_(self.temporal_projection.bias, 0.0)
-        if self.reference_projection is not None:
-            nn.init.orthogonal_(self.reference_projection.weight, gain=0.01)
-            nn.init.constant_(self.reference_projection.bias, 0.0)
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
         nn.init.constant_(self.critic.bias, 0.0)
 
@@ -116,20 +94,19 @@ class ActorCritic(nn.Module):
             device = next(self.parameters()).device
         return torch.zeros(batch_size, self.recurrent_hidden_size, dtype=torch.float32, device=device)
 
-    def actor_parameters(self):
-        modules = [
-            self.actor_body,
-            self.actor_gru,
-            self.temporal_projection,
-            self.actor_mean,
-        ]
-        if self.reference_encoder is not None:
-            modules.extend((self.reference_encoder, self.reference_projection))
-        for module in modules:
+    def actor_backbone_parameters(self):
+        for module in (self.actor_body, self.actor_mean):
+            yield from module.parameters()
+        yield self.log_std
+
+    def actor_recurrent_parameters(self):
+        for module in (self.actor_gru, self.temporal_projection):
             yield from module.parameters()
         yield self.temporal_gate
-        yield self.reference_gate
-        yield self.log_std
+
+    def actor_parameters(self):
+        yield from self.actor_backbone_parameters()
+        yield from self.actor_recurrent_parameters()
 
     def critic_parameters(self):
         yield from self.critic_body.parameters()
@@ -150,14 +127,9 @@ class ActorCritic(nn.Module):
             )
         if episode_start is not None:
             hidden_state = hidden_state * (1.0 - episode_start.to(obs.dtype).reshape(-1, 1))
-        base_obs = obs[:, : self.base_obs_dim]
-        base_features = self.actor_body(base_obs)
+        base_features = self.actor_body(obs)
         next_hidden = self.actor_gru(base_features, hidden_state)
         features = base_features + torch.tanh(self.temporal_gate) * self.temporal_projection(next_hidden)
-        if self.reference_dim > 0:
-            reference = obs[:, self.base_obs_dim :]
-            reference_features = self.reference_projection(self.reference_encoder(reference))
-            features = features + torch.tanh(self.reference_gate) * reference_features
         return features, next_hidden
 
     def distribution_from_features(self, features: torch.Tensor) -> Normal:
@@ -265,12 +237,14 @@ class ActorCritic(nn.Module):
             "obs_dim": self.obs_dim,
             "action_dim": self.action_dim,
             "critic_obs_dim": self.critic_obs_dim,
-            "base_obs_dim": self.base_obs_dim,
-            "reference_dim": self.reference_dim,
             "actor_hidden_sizes": list(self.actor_hidden_sizes),
             "critic_hidden_sizes": list(self.critic_hidden_sizes),
             "recurrent_hidden_size": self.recurrent_hidden_size,
-            "reference_hidden_size": self.reference_hidden_size,
+            "temporal_gate_raw": float(self.temporal_gate.detach().cpu()),
+            "temporal_gate_effective": float(
+                torch.tanh(self.temporal_gate).detach().cpu()
+            ),
+            "temporal_gate": float(torch.tanh(self.temporal_gate).detach().cpu()),
             "activation": self.activation,
             "action_distribution": "tanh_squashed_normal",
             "recurrent": True,
@@ -436,6 +410,65 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         plt.close(fig)
 
         fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
+        axes[0].plot(
+            x,
+            [r.get("moving_xy_good_sample_fraction", 0.0) for r in update_rows],
+            label="XY",
+        )
+        axes[0].plot(
+            x,
+            [r.get("moving_z_good_sample_fraction", 0.0) for r in update_rows],
+            label="Z",
+        )
+        axes[0].plot(
+            x,
+            [r.get("moving_velocity_good_sample_fraction", 0.0) for r in update_rows],
+            label="velocity",
+        )
+        axes[0].plot(
+            x,
+            [r.get("moving_good_sample_fraction", 0.0) for r in update_rows],
+            label="joint",
+        )
+        axes[0].set_ylim(0.0, 1.05)
+        axes[0].set_ylabel("moving fraction")
+        axes[0].legend()
+        axes[1].plot(
+            x,
+            [r.get("stopped_xy_good_sample_fraction", 0.0) for r in update_rows],
+            label="XY",
+        )
+        axes[1].plot(
+            x,
+            [r.get("stopped_z_good_sample_fraction", 0.0) for r in update_rows],
+            label="Z",
+        )
+        axes[1].plot(
+            x,
+            [r.get("stopped_speed_good_sample_fraction", 0.0) for r in update_rows],
+            label="speed",
+        )
+        axes[1].set_ylim(0.0, 1.05)
+        axes[1].set_ylabel("stopped fraction")
+        axes[1].legend()
+        axes[2].plot(
+            x,
+            [r.get("temporal_gate_raw", 0.0) for r in update_rows],
+            label="raw gate",
+        )
+        axes[2].plot(
+            x,
+            [r.get("temporal_gate_effective", 0.0) for r in update_rows],
+            label="tanh(gate)",
+        )
+        axes[2].set_ylabel("GRU residual gate")
+        axes[2].set_xlabel("env steps")
+        axes[2].legend()
+        fig.tight_layout()
+        fig.savefig(plot_dir / "condition_diagnostics.png", dpi=150)
+        plt.close(fig)
+
+        fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
         axes[0].plot(x, [r["policy_loss"] for r in update_rows], label="policy loss")
         axes[0].plot(x, [r["value_loss"] for r in update_rows], label="value loss")
         axes[0].legend()
@@ -536,6 +569,38 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
             axes[-1].set_xlabel("env steps")
             fig.tight_layout()
             fig.savefig(plot_dir / "primitive_performance.png", dpi=150)
+            plt.close(fig)
+
+            condition_metrics = (
+                ("primitive_xy_good_fraction", "XY good fraction"),
+                ("primitive_z_good_fraction", "Z good fraction"),
+                ("primitive_velocity_good_fraction", "velocity good fraction"),
+                ("primitive_good_fraction", "joint good fraction"),
+            )
+            parsed_conditions = {
+                metric: [
+                    json.loads(row.get(metric, "{}"))
+                    if isinstance(row.get(metric, "{}"), str)
+                    else row.get(metric, {})
+                    for row in update_rows
+                ]
+                for metric, _ in condition_metrics
+            }
+            fig, axes = plt.subplots(4, 1, figsize=(11, 13), sharex=True)
+            for axis, (metric, ylabel) in zip(axes, condition_metrics):
+                rows = parsed_conditions[metric]
+                for primitive in primitive_names:
+                    axis.plot(
+                        x,
+                        [float(row.get(primitive, np.nan)) for row in rows],
+                        label=primitive,
+                    )
+                axis.set_ylim(0.0, 1.05)
+                axis.set_ylabel(ylabel)
+                axis.legend()
+            axes[-1].set_xlabel("env steps")
+            fig.tight_layout()
+            fig.savefig(plot_dir / "primitive_conditions.png", dpi=150)
             plt.close(fig)
     if episode_rows:
         fig, axes = plt.subplots(4, 1, figsize=(11, 13), sharex=True)
@@ -638,6 +703,43 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         axes[3].legend(loc="upper left")
         fig.tight_layout()
         fig.savefig(plot_dir / "episode_outcomes.png", dpi=150)
+        plt.close(fig)
+
+        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        for key, label in (
+            ("moving_xy_good_fraction", "XY"),
+            ("moving_z_good_fraction", "Z"),
+            ("moving_velocity_good_fraction", "velocity"),
+            ("moving_good_fraction", "joint"),
+        ):
+            axes[0].plot(
+                episode_index,
+                [r.get(key, 0.0) for r in episode_rows],
+                ".",
+                markersize=3,
+                label=label,
+            )
+        axes[0].set_ylim(0.0, 1.05)
+        axes[0].set_ylabel("moving fraction")
+        axes[0].legend()
+        for key, label in (
+            ("stopped_xy_good_fraction", "XY"),
+            ("stopped_z_good_fraction", "Z"),
+            ("stopped_speed_good_fraction", "speed"),
+        ):
+            axes[1].plot(
+                episode_index,
+                [r.get(key, 0.0) for r in episode_rows],
+                ".",
+                markersize=3,
+                label=label,
+            )
+        axes[1].set_ylim(0.0, 1.05)
+        axes[1].set_ylabel("stopped fraction")
+        axes[1].set_xlabel("completed episode")
+        axes[1].legend()
+        fig.tight_layout()
+        fig.savefig(plot_dir / "episode_condition_fractions.png", dpi=150)
         plt.close(fig)
 
         def save_conditioned_performance_plot(
@@ -862,10 +964,17 @@ def load_transplanted_checkpoint(
     device: torch.device,
     allow_partial: bool = False,
 ) -> dict:
+    # Keep optimizer and RNG payloads on CPU. Model tensors are moved to the
+    # policy device individually below, while CUDA RNG restoration requires
+    # CPU ByteTensors.
     try:
-        state_dict = torch.load(checkpoint, map_location=device, weights_only=False)
+        state_dict = torch.load(
+            checkpoint,
+            map_location=torch.device("cpu"),
+            weights_only=False,
+        )
     except TypeError:
-        state_dict = torch.load(checkpoint, map_location=device)
+        state_dict = torch.load(checkpoint, map_location=torch.device("cpu"))
     checkpoint_payload = state_dict
     if isinstance(checkpoint_payload, dict) and "state_dict" in checkpoint_payload:
         state_dict = checkpoint_payload["state_dict"]
@@ -941,17 +1050,29 @@ def restore_training_state(
     except (ValueError, KeyError) as exc:
         print(f"[FAST PPO] optimizer state is incompatible ({exc}); optimizers start fresh")
         return False
-    if "python_random_state" in checkpoint_payload:
-        random.setstate(checkpoint_payload["python_random_state"])
-    if "numpy_random_state" in checkpoint_payload:
-        np.random.set_state(checkpoint_payload["numpy_random_state"])
-    if "torch_random_state" in checkpoint_payload:
-        torch.set_rng_state(checkpoint_payload["torch_random_state"].cpu())
-    if torch.cuda.is_available() and checkpoint_payload.get("torch_cuda_random_state") is not None:
-        torch.cuda.set_rng_state_all(checkpoint_payload["torch_cuda_random_state"])
-    if env_rng is not None and checkpoint_payload.get("env_rng_state") is not None:
-        env_rng.bit_generator.state = checkpoint_payload["env_rng_state"]
-    print("[FAST PPO] restored actor/critic optimizer and RNG states")
+    rng_restored = True
+    try:
+        if "python_random_state" in checkpoint_payload:
+            random.setstate(checkpoint_payload["python_random_state"])
+        if "numpy_random_state" in checkpoint_payload:
+            np.random.set_state(checkpoint_payload["numpy_random_state"])
+        if "torch_random_state" in checkpoint_payload:
+            torch.set_rng_state(checkpoint_payload["torch_random_state"].cpu())
+        cuda_rng_state = checkpoint_payload.get("torch_cuda_random_state")
+        if torch.cuda.is_available() and cuda_rng_state is not None:
+            torch.cuda.set_rng_state_all([state.cpu() for state in cuda_rng_state])
+        if env_rng is not None and checkpoint_payload.get("env_rng_state") is not None:
+            env_rng.bit_generator.state = checkpoint_payload["env_rng_state"]
+    except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+        rng_restored = False
+        print(
+            f"[FAST PPO] RNG state is incompatible ({exc}); "
+            "continuing with current RNG states"
+        )
+    if rng_restored:
+        print("[FAST PPO] restored actor/critic optimizer and RNG states")
+    else:
+        print("[FAST PPO] restored actor/critic optimizer states")
     return True
 
 

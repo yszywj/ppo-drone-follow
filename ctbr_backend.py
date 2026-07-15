@@ -238,24 +238,39 @@ def observation_vector(
         prev,
     ]
     if future_reference_positions is not None:
-        future = np.asarray(future_reference_positions, dtype=np.float64)
-        if future.ndim != 2 or future.shape[1] != 3:
-            raise ValueError(
-                "future_reference_positions must have shape (horizon, 3), "
-                f"got {future.shape}"
+        components.append(
+            future_reference_vector(
+                own,
+                future_reference_positions,
+                yaw_reference=yaw_reference,
             )
-        future_relative = np.zeros_like(future, dtype=np.float32)
-        for index, reference in enumerate(future):
-            dx, dy = rotate_world_xy_to_policy_frame(
-                reference[0] - own.x,
-                reference[1] - own.y,
-                own.yaw,
-                yaw_reference,
-            )
-            future_relative[index] = [dx, dy, reference[2] - own.z]
-        components.append((future_relative.reshape(-1) / 5.0).astype(np.float32))
+        )
     vec = np.concatenate(components).astype(np.float32)
     return np.clip(vec, -5.0, 5.0).astype(np.float32)
+
+
+def future_reference_vector(
+    own: ObservationData,
+    future_reference_positions: Sequence[Sequence[float]],
+    yaw_reference: Optional[float] = None,
+) -> np.ndarray:
+    """Encode simulator trajectory preview for privileged critic input."""
+    future = np.asarray(future_reference_positions, dtype=np.float64)
+    if future.ndim != 2 or future.shape[1] != 3:
+        raise ValueError(
+            "future_reference_positions must have shape (horizon, 3), "
+            f"got {future.shape}"
+        )
+    future_relative = np.zeros_like(future, dtype=np.float32)
+    for index, reference in enumerate(future):
+        dx, dy = rotate_world_xy_to_policy_frame(
+            reference[0] - own.x,
+            reference[1] - own.y,
+            own.yaw,
+            yaw_reference,
+        )
+        future_relative[index] = [dx, dy, reference[2] - own.z]
+    return np.clip(future_relative.reshape(-1) / 5.0, -5.0, 5.0).astype(np.float32)
 
 
 def goal_distance(obs: ObservationData, goal: GoalPoint) -> float:

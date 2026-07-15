@@ -28,6 +28,7 @@ from .ctbr_backend import (
     SafetyLimits,
     clamp,
     enu_to_ned,
+    future_reference_vector,
     goal_distance,
     map_policy_action_to_ctbr,
     ned_to_enu,
@@ -168,10 +169,12 @@ class FastIrisLineFollowVecEnv:
         self.task_config = task_config
         self.num_envs = int(config.num_envs)
         self.reference_horizon_sec = tuple(task_config.motion_pool.reference_horizon_sec)
-        self.reference_dim = 3 * len(self.reference_horizon_sec)
-        self.obs_dim = self.base_obs_dim + self.reference_dim
+        self.future_reference_dim = 3 * len(self.reference_horizon_sec)
+        self.obs_dim = self.base_obs_dim
         self.privileged_obs_dim = 4 + len(PRIMITIVE_CODES) + 16
-        self.critic_obs_dim = self.obs_dim + self.privileged_obs_dim
+        self.critic_obs_dim = (
+            self.obs_dim + self.future_reference_dim + self.privileged_obs_dim
+        )
         self._rng = np.random.default_rng(config.seed)
         self._sim_steps_per_policy_step = max(1, int(round(config.step_dt_sim_sec / config.physics_dt)))
         self._episode_id = np.zeros(self.num_envs, dtype=np.int64)
@@ -198,7 +201,27 @@ class FastIrisLineFollowVecEnv:
         self._moving_eligible_steps = np.zeros(self.num_envs, dtype=np.int64)
         self._moving_good_steps = np.zeros(self.num_envs, dtype=np.int64)
         self._moving_good_fraction = np.zeros(self.num_envs, dtype=np.float64)
+        self._moving_xy_good_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._moving_z_good_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._moving_velocity_good_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._moving_xy_good_fraction = np.zeros(self.num_envs, dtype=np.float64)
+        self._moving_z_good_fraction = np.zeros(self.num_envs, dtype=np.float64)
+        self._moving_velocity_good_fraction = np.zeros(self.num_envs, dtype=np.float64)
+        self._moving_xy_good = np.zeros(self.num_envs, dtype=bool)
+        self._moving_z_good = np.zeros(self.num_envs, dtype=bool)
+        self._moving_velocity_good = np.zeros(self.num_envs, dtype=bool)
+        self._moving_good = np.zeros(self.num_envs, dtype=bool)
         self._stopped_track_dwell_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._stopped_eligible_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._stopped_xy_good_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._stopped_z_good_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._stopped_speed_good_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._stopped_xy_good_fraction = np.zeros(self.num_envs, dtype=np.float64)
+        self._stopped_z_good_fraction = np.zeros(self.num_envs, dtype=np.float64)
+        self._stopped_speed_good_fraction = np.zeros(self.num_envs, dtype=np.float64)
+        self._stopped_xy_good = np.zeros(self.num_envs, dtype=bool)
+        self._stopped_z_good = np.zeros(self.num_envs, dtype=bool)
+        self._stopped_speed_good = np.zeros(self.num_envs, dtype=bool)
         self._moving_success_met = np.zeros(self.num_envs, dtype=bool)
         self._line_dir = np.tile(np.array([[1.0, 0.0]], dtype=np.float64), (self.num_envs, 1))
         self._line_length_m = np.full(
@@ -356,7 +379,27 @@ class FastIrisLineFollowVecEnv:
         self._moving_eligible_steps[env_id] = 0
         self._moving_good_steps[env_id] = 0
         self._moving_good_fraction[env_id] = 0.0
+        self._moving_xy_good_steps[env_id] = 0
+        self._moving_z_good_steps[env_id] = 0
+        self._moving_velocity_good_steps[env_id] = 0
+        self._moving_xy_good_fraction[env_id] = 0.0
+        self._moving_z_good_fraction[env_id] = 0.0
+        self._moving_velocity_good_fraction[env_id] = 0.0
+        self._moving_xy_good[env_id] = False
+        self._moving_z_good[env_id] = False
+        self._moving_velocity_good[env_id] = False
+        self._moving_good[env_id] = False
         self._stopped_track_dwell_steps[env_id] = 0
+        self._stopped_eligible_steps[env_id] = 0
+        self._stopped_xy_good_steps[env_id] = 0
+        self._stopped_z_good_steps[env_id] = 0
+        self._stopped_speed_good_steps[env_id] = 0
+        self._stopped_xy_good_fraction[env_id] = 0.0
+        self._stopped_z_good_fraction[env_id] = 0.0
+        self._stopped_speed_good_fraction[env_id] = 0.0
+        self._stopped_xy_good[env_id] = False
+        self._stopped_z_good[env_id] = False
+        self._stopped_speed_good[env_id] = False
         self._moving_success_met[env_id] = False
         self._target_accel_ned[env_id, :] = 0.0
         self._goal_vel_ned[env_id, :] = 0.0
@@ -934,7 +977,6 @@ class FastIrisLineFollowVecEnv:
             prev_command=self._prev_action[env_id],
             action_limits=self.config.action_limits,
             yaw_reference=self._policy_yaw_reference[env_id],
-            future_reference_positions=self._future_reference_positions(env_id),
         )
         if policy_obs.shape != (self.obs_dim,):
             raise RuntimeError(
@@ -955,7 +997,33 @@ class FastIrisLineFollowVecEnv:
             [self._build_privileged_obs_one(env_id) for env_id in range(self.num_envs)],
             axis=0,
         ).astype(np.float32)
-        return np.concatenate((actor_obs, privileged), axis=1).astype(np.float32)
+        if self.future_reference_dim > 0:
+            future_reference = np.stack(
+                [self._build_critic_future_reference_one(env_id) for env_id in range(self.num_envs)],
+                axis=0,
+            ).astype(np.float32)
+        else:
+            future_reference = np.zeros((self.num_envs, 0), dtype=np.float32)
+        critic_obs = np.concatenate(
+            (actor_obs, future_reference, privileged),
+            axis=1,
+        ).astype(np.float32)
+        if critic_obs.shape != (self.num_envs, self.critic_obs_dim):
+            raise RuntimeError(
+                f"critic observation has shape {critic_obs.shape}, expected "
+                f"({self.num_envs}, {self.critic_obs_dim})"
+            )
+        return critic_obs
+
+    def _build_critic_future_reference_one(self, env_id: int) -> np.ndarray:
+        future_positions = self._future_reference_positions(env_id)
+        if future_positions is None:
+            return np.zeros(0, dtype=np.float32)
+        return future_reference_vector(
+            self._obs_data(env_id),
+            future_positions,
+            yaw_reference=self._policy_yaw_reference[env_id],
+        )
 
     def _build_privileged_obs_one(self, env_id: int) -> np.ndarray:
         phase_names = ("capture", "moving", "decelerating", "stopped")
@@ -1106,6 +1174,13 @@ class FastIrisLineFollowVecEnv:
         capture_position_inside = False
         capture_inside = False
         moving_good = False
+        self._moving_xy_good[env_id] = False
+        self._moving_z_good[env_id] = False
+        self._moving_velocity_good[env_id] = False
+        self._moving_good[env_id] = False
+        self._stopped_xy_good[env_id] = False
+        self._stopped_z_good[env_id] = False
+        self._stopped_speed_good[env_id] = False
         self._last_velocity_error[env_id] = vel_err
         self._target_distance[env_id] = target_distance
         previous_speed_xy = (
@@ -1149,6 +1224,30 @@ class FastIrisLineFollowVecEnv:
                 self._motion_start_step[env_id] = int(self._step_id[env_id])
                 capture_acquired_now = True
         elif bool(status["target_stopped"]):
+            self._stopped_xy_good[env_id] = (
+                xy_err <= self.task_config.tracking_xy_tolerance_m
+            )
+            self._stopped_z_good[env_id] = (
+                z_err <= self.task_config.tracking_z_tolerance_m
+            )
+            self._stopped_speed_good[env_id] = (
+                speed_xy <= self.task_config.stopped_speed_xy_tolerance_mps
+                and speed_z <= self.task_config.stopped_speed_z_tolerance_mps
+            )
+            self._stopped_eligible_steps[env_id] += 1
+            self._stopped_xy_good_steps[env_id] += int(self._stopped_xy_good[env_id])
+            self._stopped_z_good_steps[env_id] += int(self._stopped_z_good[env_id])
+            self._stopped_speed_good_steps[env_id] += int(self._stopped_speed_good[env_id])
+            stopped_denominator = float(max(1, self._stopped_eligible_steps[env_id]))
+            self._stopped_xy_good_fraction[env_id] = (
+                float(self._stopped_xy_good_steps[env_id]) / stopped_denominator
+            )
+            self._stopped_z_good_fraction[env_id] = (
+                float(self._stopped_z_good_steps[env_id]) / stopped_denominator
+            )
+            self._stopped_speed_good_fraction[env_id] = (
+                float(self._stopped_speed_good_steps[env_id]) / stopped_denominator
+            )
             self._stopped_track_dwell_steps[env_id] = self._stopped_track_dwell_steps[env_id] + 1 if status["inside"] else 0
             self._goal_dwell_steps[env_id] = self._stopped_track_dwell_steps[env_id]
             self._goal_dwell_fraction[env_id] = min(
@@ -1158,20 +1257,46 @@ class FastIrisLineFollowVecEnv:
         else:
             inside_moving_track = bool(status["inside"]) and moving_track_eligible
             self._moving_track_dwell_steps[env_id] = self._moving_track_dwell_steps[env_id] + 1 if inside_moving_track else 0
-            moving_good = (
+            self._moving_xy_good[env_id] = (
                 moving_track_eligible
                 and xy_err <= self.task_config.moving_success_xy_tolerance_m
+            )
+            self._moving_z_good[env_id] = (
+                moving_track_eligible
                 and z_err <= self.task_config.tracking_z_tolerance_m
+            )
+            self._moving_velocity_good[env_id] = (
+                moving_track_eligible
                 and vel_err <= self.task_config.moving_success_velocity_tolerance_mps
             )
+            moving_good = bool(
+                self._moving_xy_good[env_id]
+                and self._moving_z_good[env_id]
+                and self._moving_velocity_good[env_id]
+            )
+            self._moving_good[env_id] = moving_good
             if moving_track_eligible:
                 self._moving_eligible_steps[env_id] += 1
+                self._moving_xy_good_steps[env_id] += int(self._moving_xy_good[env_id])
+                self._moving_z_good_steps[env_id] += int(self._moving_z_good[env_id])
+                self._moving_velocity_good_steps[env_id] += int(
+                    self._moving_velocity_good[env_id]
+                )
                 if moving_good:
                     self._moving_good_steps[env_id] += 1
-                self._moving_good_fraction[env_id] = (
-                    float(self._moving_good_steps[env_id])
-                    / float(max(1, self._moving_eligible_steps[env_id]))
-                )
+                moving_denominator = float(max(1, self._moving_eligible_steps[env_id]))
+                self._moving_good_fraction[env_id] = float(
+                    self._moving_good_steps[env_id]
+                ) / moving_denominator
+                self._moving_xy_good_fraction[env_id] = float(
+                    self._moving_xy_good_steps[env_id]
+                ) / moving_denominator
+                self._moving_z_good_fraction[env_id] = float(
+                    self._moving_z_good_steps[env_id]
+                ) / moving_denominator
+                self._moving_velocity_good_fraction[env_id] = float(
+                    self._moving_velocity_good_steps[env_id]
+                ) / moving_denominator
                 self._moving_success_met[env_id] = (
                     self._moving_good_fraction[env_id]
                     >= self.task_config.moving_success_min_fraction
@@ -1598,12 +1723,34 @@ class FastIrisLineFollowVecEnv:
             "capture_radius_m": float(self.task_config.capture_radius_m),
             "capture_hold_sec": float(self.task_config.capture_hold_sec),
             "moving_reward_min_progress_fraction": float(self.task_config.moving_reward_min_progress_fraction),
+            "moving_track_eligible": bool(
+                self._capture_acquired[env_id]
+                and not self._target_is_stopped(env_id)
+                and self._target_progress_fraction[env_id]
+                >= self.task_config.moving_reward_min_progress_fraction
+            ),
             "moving_success_met": bool(self._moving_success_met[env_id]),
             "moving_track_dwell_steps": int(self._moving_track_dwell_steps[env_id]),
             "required_moving_track_steps": int(self.required_moving_track_steps),
             "moving_eligible_steps": int(self._moving_eligible_steps[env_id]),
             "moving_good_steps": int(self._moving_good_steps[env_id]),
             "moving_good_fraction": float(self._moving_good_fraction[env_id]),
+            "moving_xy_good": bool(self._moving_xy_good[env_id]),
+            "moving_z_good": bool(self._moving_z_good[env_id]),
+            "moving_velocity_good": bool(self._moving_velocity_good[env_id]),
+            "moving_good": bool(self._moving_good[env_id]),
+            "moving_xy_good_steps": int(self._moving_xy_good_steps[env_id]),
+            "moving_z_good_steps": int(self._moving_z_good_steps[env_id]),
+            "moving_velocity_good_steps": int(
+                self._moving_velocity_good_steps[env_id]
+            ),
+            "moving_xy_good_fraction": float(
+                self._moving_xy_good_fraction[env_id]
+            ),
+            "moving_z_good_fraction": float(self._moving_z_good_fraction[env_id]),
+            "moving_velocity_good_fraction": float(
+                self._moving_velocity_good_fraction[env_id]
+            ),
             "moving_success_min_fraction": float(self.task_config.moving_success_min_fraction),
             "moving_success_xy_tolerance_m": float(self.task_config.moving_success_xy_tolerance_m),
             "moving_success_velocity_tolerance_mps": float(
@@ -1611,5 +1758,19 @@ class FastIrisLineFollowVecEnv:
             ),
             "stopped_track_dwell_steps": int(self._stopped_track_dwell_steps[env_id]),
             "required_stopped_track_steps": int(self.required_stopped_track_steps),
+            "stopped_eligible_steps": int(self._stopped_eligible_steps[env_id]),
+            "stopped_xy_good": bool(self._stopped_xy_good[env_id]),
+            "stopped_z_good": bool(self._stopped_z_good[env_id]),
+            "stopped_speed_good": bool(self._stopped_speed_good[env_id]),
+            "stopped_xy_good_steps": int(self._stopped_xy_good_steps[env_id]),
+            "stopped_z_good_steps": int(self._stopped_z_good_steps[env_id]),
+            "stopped_speed_good_steps": int(self._stopped_speed_good_steps[env_id]),
+            "stopped_xy_good_fraction": float(
+                self._stopped_xy_good_fraction[env_id]
+            ),
+            "stopped_z_good_fraction": float(self._stopped_z_good_fraction[env_id]),
+            "stopped_speed_good_fraction": float(
+                self._stopped_speed_good_fraction[env_id]
+            ),
             **self._last_reward_terms[env_id],
         }

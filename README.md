@@ -17,8 +17,8 @@ helper is temporary and is reduced through the training curriculum.
 
 ## Actor and critic
 
-The Actor uses measurable vehicle state and task references only. Its base 32
-values contain:
+The deployed Actor has 32 causal inputs. They are measurable vehicle state and
+current task references only:
 
 - local NED position, velocity and acceleration
 - roll, pitch, sine/cosine yaw and FRD body rates
@@ -27,29 +27,31 @@ values contain:
 - desired following-point velocity and acceleration
 - previous applied CTBR command
 
-The default task config appends five future following points at 0.2, 0.4, 0.8,
-1.2 and 1.6 seconds. This produces 47 Actor inputs: 32 base values plus 15
-future-reference values. Future points are relative to the drone in the same
-policy frame. During capture they are held at the current capture point.
+No future trajectory point, primitive ID, phase ID or trajectory progress is an
+Actor input. In particular, a path sampled by the simulator cannot leak into
+the policy that will be deployed against an unknown real target.
 
 The Actor is:
 
 ```text
-base observation -> 256-256-128 ELU frame encoder
+32 causal values -> 256-256-128 ELU frame encoder
 frame embedding history -> GRU 128
-future points -> reference encoder 128
-gated fusion -> tanh-squashed Gaussian CTBR action
+small gated recurrent residual -> tanh-squashed Gaussian CTBR action
 ```
 
-The old frame encoder and action head keep their parameter names. A previous
-32-observation MLP checkpoint can therefore initialize the new Actor exactly.
-The GRU and future-reference branches start behind zero-valued residual gates,
-so loading the old checkpoint does not immediately change its action output.
+The frame encoder, GRU and action head keep their parameter names. A previous
+47-input checkpoint from this project can therefore transfer all shared Actor
+tensors; its removed future-reference encoder and gate are explicitly skipped.
+For the bridge run, the recurrent residual starts at a small nonzero gate, is
+held fixed for 15 updates, then becomes trainable. The inherited frame policy
+uses a lower learning rate while the GRU branch uses a higher learning rate.
 
-The Critic is asymmetric. In addition to the Actor observation it receives
-simulator-only phase, primitive ID, segment progress, remaining episode time,
-true target/reference velocity and acceleration, and control mix ratio. These
-values are never inputs to the deployed Actor.
+The asymmetric Critic remains 77-dimensional: 32 Actor values, 15 future
+following-point values at 0.2, 0.4, 0.8, 1.2 and 1.6 seconds, and 30 privileged
+values. The last group contains simulator-only phase, primitive ID, segment
+progress, remaining episode time, true target/reference velocity and
+acceleration, and control mix ratio. The generated future trajectory is thus a
+training-only value baseline aid; neither privileged group reaches the Actor.
 
 Recurrent PPO minibatches preserve complete time sequences and split by
 environment rather than randomly mixing individual transitions. Actor and
@@ -141,16 +143,19 @@ argument names. A command-line scalar still overrides the config value. Relative
 
 Available curriculum configs:
 
+- `bridge_causal_actor_5hz_ratio_5to5.json`: 100k-step compatibility run from
+  `seed43_20260715_004143`; removes future points from the Actor while keeping
+  the current speed-only task and resets the GRU gate/optimizers.
 - `stage1_speed_pool_5hz_ratio_5to5.json`: random acceleration, cruise and
   deceleration segments; no turns or altitude changes.
 - `stage2_turn_pool_5hz_ratio_5to5.json`: adds turn segments and requires at
   least one real turn per episode. Replace `REPLACE_WITH_STAGE1_RUN` with the
   selected Stage 1 result directory before running it.
 
-The Stage 1 config migrates the latest straight-line 5:5 Actor checkpoint. It
-sets `allow_partial_checkpoint=true` because the asymmetric Critic input layer
-is wider. The migration is expected to report exact Actor tensors and one
-partially expanded Critic input tensor.
+The bridge config sets `allow_partial_checkpoint=true` because the old
+checkpoint contains the removed Actor future-reference branch. The 77-value
+Critic layout and all shared tensor shapes are preserved, so migration should
+report exact shared tensors and only skip the obsolete reference tensors.
 
 New checkpoints include Actor and Critic optimizer states plus Python, NumPy,
 Torch and environment RNG states. A legacy checkpoint has no optimizer state,
@@ -167,8 +172,11 @@ Each run keeps the timestamp naming style `seed43_YYYYMMDD_HHMMSS` and stores:
 - update and episode CSV files
 - tracking, reward, PPO, outcome, direction/radius and primitive plots
 
-Update metrics include per-primitive sample counts, XY/Z/velocity error and
-good-step fraction. `plots/primitive_performance.png` compares primitive types.
+Update metrics include the raw/effective GRU gate, separate backbone/recurrent
+learning rates, and moving/stopped XY, Z, velocity and joint good fractions.
+Those conditions are also split by primitive in
+`plots/primitive_conditions.png`; `condition_diagnostics.png` and
+`episode_condition_fractions.png` expose the main success bottleneck directly.
 Episode rows include the sampled primitive sequence, trajectory duration,
 curvature and actual 3D target/follow endpoint.
 

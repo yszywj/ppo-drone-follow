@@ -27,7 +27,11 @@
     "actor_hidden_sizes": [256, 256, 128],
     "critic_hidden_sizes": [256, 256, 128],
     "recurrent_hidden_size": 128,
-    "reference_hidden_size": 128,
+    "temporal_gate_init": 0.05,
+    "temporal_gate_warmup_updates": 15,
+    "reset_temporal_gate_on_load": true,
+    "actor_backbone_lr_multiplier": 0.5,
+    "actor_recurrent_lr_multiplier": 3.0,
     "activation": "elu",
     "init_action_std": 0.16
   },

@@ -62,7 +62,11 @@ def parse_args():
     parser.add_argument("--actor_hidden_sizes", type=int, nargs="+", default=[256, 256, 128])
     parser.add_argument("--critic_hidden_sizes", type=int, nargs="+", default=[256, 256, 128])
     parser.add_argument("--recurrent_hidden_size", type=int, default=128)
-    parser.add_argument("--reference_hidden_size", type=int, default=128)
+    parser.add_argument("--temporal_gate_init", type=float, default=0.05)
+    parser.add_argument("--temporal_gate_warmup_updates", type=int, default=15)
+    parser.add_argument("--reset_temporal_gate_on_load", action="store_true", default=False)
+    parser.add_argument("--actor_backbone_lr_multiplier", type=float, default=0.5)
+    parser.add_argument("--actor_recurrent_lr_multiplier", type=float, default=3.0)
     parser.add_argument("--activation", choices=("elu", "relu", "tanh"), default="elu")
     parser.add_argument(
         "--hidden_size",
@@ -245,8 +249,15 @@ def parse_args():
         args.critic_hidden_sizes = [args.hidden_size, args.hidden_size]
     if any(size <= 0 for size in (*args.actor_hidden_sizes, *args.critic_hidden_sizes)):
         parser.error("all actor/critic hidden layer sizes must be positive")
-    if args.recurrent_hidden_size <= 0 or args.reference_hidden_size <= 0:
-        parser.error("recurrent/reference hidden sizes must be positive")
+    if args.recurrent_hidden_size <= 0:
+        parser.error("--recurrent_hidden_size must be positive")
+    if args.temporal_gate_warmup_updates < 0:
+        parser.error("--temporal_gate_warmup_updates must be non-negative")
+    if abs(args.temporal_gate_init) > 3.0:
+        parser.error("--temporal_gate_init must be in [-3, 3]")
+    for name in ("actor_backbone_lr_multiplier", "actor_recurrent_lr_multiplier"):
+        if getattr(args, name) <= 0.0:
+            parser.error(f"--{name} must be positive")
     if args.num_mini_batch > args.num_envs:
         parser.error("--num_mini_batch cannot exceed --num_envs for recurrent PPO")
     for name in ("lr", "critic_lr", "min_lr", "value_clip_param", "target_kl"):
@@ -559,12 +570,20 @@ def main():
         "primitive_mean_xy_err",
         "primitive_mean_z_err",
         "primitive_mean_velocity_error",
+        "primitive_xy_good_fraction",
+        "primitive_z_good_fraction",
+        "primitive_velocity_good_fraction",
         "primitive_good_fraction",
         "approx_kl",
         "clip_fraction",
         "kl_early_stop",
         "actor_lr",
+        "actor_backbone_lr",
+        "actor_recurrent_lr",
         "critic_lr",
+        "temporal_gate_raw",
+        "temporal_gate_effective",
+        "temporal_gate_frozen",
         "entropy_coef_current",
         "explained_variance",
         "action_mean",
@@ -578,6 +597,9 @@ def main():
         "mean_capture_dwell_fraction",
         "moving_success_met_fraction",
         "mean_moving_good_fraction",
+        "moving_xy_good_sample_fraction",
+        "moving_z_good_sample_fraction",
+        "moving_velocity_good_sample_fraction",
         "moving_good_sample_fraction",
         "capture_phase_fraction",
         "moving_phase_fraction",
@@ -593,6 +615,9 @@ def main():
         "stopped_z_zone_fraction",
         "stopped_position_zone_fraction",
         "stopped_stationary_fraction",
+        "stopped_xy_good_sample_fraction",
+        "stopped_z_good_sample_fraction",
+        "stopped_speed_good_sample_fraction",
         "mean_braking_progress",
         "policy_loss",
         "value_loss",
@@ -655,8 +680,21 @@ def main():
         "moving_eligible_steps",
         "moving_good_steps",
         "moving_good_fraction",
+        "moving_xy_good_steps",
+        "moving_z_good_steps",
+        "moving_velocity_good_steps",
+        "moving_xy_good_fraction",
+        "moving_z_good_fraction",
+        "moving_velocity_good_fraction",
         "stopped_track_dwell_steps",
         "required_stopped_track_steps",
+        "stopped_eligible_steps",
+        "stopped_xy_good_steps",
+        "stopped_z_good_steps",
+        "stopped_speed_good_steps",
+        "stopped_xy_good_fraction",
+        "stopped_z_good_fraction",
+        "stopped_speed_good_fraction",
         "mean_goal_xy_err",
         "max_goal_xy_err",
         "mean_z_err",
@@ -698,12 +736,10 @@ def main():
             env.obs_dim,
             env.action_dim,
             critic_obs_dim=env.critic_obs_dim,
-            base_obs_dim=env.base_obs_dim,
-            reference_dim=env.reference_dim,
             actor_hidden_sizes=args.actor_hidden_sizes,
             critic_hidden_sizes=args.critic_hidden_sizes,
             recurrent_hidden_size=args.recurrent_hidden_size,
-            reference_hidden_size=args.reference_hidden_size,
+            temporal_gate_init=args.temporal_gate_init,
             activation=args.activation,
             init_std=args.init_action_std,
         ).to(device)
@@ -720,11 +756,35 @@ def main():
                 device,
                 allow_partial=args.allow_partial_checkpoint,
             )
+            if args.reset_temporal_gate_on_load:
+                with torch.no_grad():
+                    policy.temporal_gate.fill_(args.temporal_gate_init)
+                print(
+                    "[FAST PPO] reset temporal gate after checkpoint load: "
+                    f"raw={args.temporal_gate_init:.6f}, "
+                    f"effective={float(torch.tanh(policy.temporal_gate)):.6f}"
+                )
         else:
             print("[FAST PPO] starting from scratch (no checkpoint supplied)")
-        actor_parameters = list(policy.actor_parameters())
+        actor_backbone_parameters = list(policy.actor_backbone_parameters())
+        actor_recurrent_parameters = list(policy.actor_recurrent_parameters())
+        actor_parameters = [*actor_backbone_parameters, *actor_recurrent_parameters]
         critic_parameters = list(policy.critic_parameters())
-        actor_optimizer = torch.optim.Adam(actor_parameters, lr=args.lr)
+        actor_optimizer = torch.optim.Adam(
+            [
+                {
+                    "params": actor_backbone_parameters,
+                    "lr_multiplier": args.actor_backbone_lr_multiplier,
+                    "group_name": "backbone",
+                },
+                {
+                    "params": actor_recurrent_parameters,
+                    "lr_multiplier": args.actor_recurrent_lr_multiplier,
+                    "group_name": "recurrent",
+                },
+            ],
+            lr=args.lr,
+        )
         critic_optimizer = torch.optim.Adam(critic_parameters, lr=args.critic_lr)
         if checkpoint_payload and not args.reset_optimizer:
             restore_training_state(
@@ -732,6 +792,13 @@ def main():
                 actor_optimizer,
                 critic_optimizer,
                 env_rng=env._rng,
+            )
+        temporal_gate_frozen = args.temporal_gate_warmup_updates > 0
+        policy.temporal_gate.requires_grad_(not temporal_gate_frozen)
+        if temporal_gate_frozen:
+            print(
+                "[FAST PPO] temporal gate fixed for the first "
+                f"{args.temporal_gate_warmup_updates} updates"
             )
 
         print("=" * 88)
@@ -745,17 +812,24 @@ def main():
             f"sim_steps/policy_step: {env._sim_steps_per_policy_step}"
         )
         print(
-            f"actor_obs_dim: {env.obs_dim} (base={env.base_obs_dim}, future_ref={env.reference_dim}), "
-            f"critic_obs_dim: {env.critic_obs_dim}, action_dim: {env.action_dim}, "
+            f"actor_obs_dim: {env.obs_dim} (causal current state only), "
+            f"critic_obs_dim: {env.critic_obs_dim} "
+            f"(future_ref={env.future_reference_dim} privileged), "
+            f"action_dim: {env.action_dim}, "
             f"actor={args.actor_hidden_sizes}, critic={args.critic_hidden_sizes}, "
-            f"gru={args.recurrent_hidden_size}, reference_encoder={args.reference_hidden_size}, "
+            f"gru={args.recurrent_hidden_size}, temporal_gate_init={args.temporal_gate_init}, "
             f"activation={args.activation}, distribution=tanh_squashed_normal, "
             f"parameters={sum(parameter.numel() for parameter in policy.parameters())}"
         )
         print(
             "policy_observation: vehicle position/velocity/acceleration/attitude/body rates, "
             "desired follow point, target position, follow-reference velocity/acceleration, "
-            "previous CTBR command, and future follow points; phase/task ids are critic-only"
+            "and previous CTBR command; future follow points and phase/task ids are critic-only"
+        )
+        print(
+            "actor_learning_rates: "
+            f"backbone={args.actor_backbone_lr_multiplier}x, "
+            f"recurrent={args.actor_recurrent_lr_multiplier}x base actor LR"
         )
         line_length_description = (
             f"[{args.line_length_min_m}, {args.line_length_max_m}]m "
@@ -848,6 +922,13 @@ def main():
         recurrent_hidden = policy.initial_state(args.num_envs, device=device)
         episode_start = np.ones(args.num_envs, dtype=bool)
         while total_steps < args.num_env_steps:
+            if temporal_gate_frozen and update >= args.temporal_gate_warmup_updates:
+                policy.temporal_gate.requires_grad_(True)
+                temporal_gate_frozen = False
+                print(
+                    "[FAST PPO] temporal gate is now trainable at "
+                    f"update={update}, effective={float(torch.tanh(policy.temporal_gate)):.6f}"
+                )
             update_start_wall = time.perf_counter()
             obs_buf = []
             critic_obs_buf = []
@@ -876,12 +957,18 @@ def main():
             stats_capture_dwell = []
             stats_moving_met = []
             stats_moving_good_fraction = []
+            stats_moving_xy_good_sample = []
+            stats_moving_z_good_sample = []
+            stats_moving_velocity_good_sample = []
             stats_moving_good_sample = []
             stats_phases = Counter()
             stats_primitives = Counter()
             stats_primitive_xy = {key: [] for key in PRIMITIVE_CODES}
             stats_primitive_z = {key: [] for key in PRIMITIVE_CODES}
             stats_primitive_velocity = {key: [] for key in PRIMITIVE_CODES}
+            stats_primitive_xy_good = {key: [] for key in PRIMITIVE_CODES}
+            stats_primitive_z_good = {key: [] for key in PRIMITIVE_CODES}
+            stats_primitive_velocity_good = {key: [] for key in PRIMITIVE_CODES}
             stats_primitive_good = {key: [] for key in PRIMITIVE_CODES}
             stats_stopped_xy = []
             stats_stopped_speed_xy = []
@@ -952,26 +1039,38 @@ def main():
                     stats_capture_dwell.append(float(info.get("capture_dwell_fraction", 0.0)))
                     stats_moving_met.append(1.0 if info.get("moving_success_met") else 0.0)
                     stats_moving_good_fraction.append(float(info.get("moving_good_fraction", 0.0)))
-                    if phase == "moving" and float(info.get("moving_eligible_steps", 0.0)) > 0:
+                    moving_track_eligible = bool(info.get("moving_track_eligible", False))
+                    if moving_track_eligible:
+                        stats_moving_xy_good_sample.append(
+                            1.0 if info.get("moving_xy_good") else 0.0
+                        )
+                        stats_moving_z_good_sample.append(
+                            1.0 if info.get("moving_z_good") else 0.0
+                        )
+                        stats_moving_velocity_good_sample.append(
+                            1.0 if info.get("moving_velocity_good") else 0.0
+                        )
                         stats_moving_good_sample.append(
-                            1.0
-                            if float(info.get("moving_good_fraction", 0.0))
-                            >= args.moving_success_min_fraction
-                            else 0.0
+                            1.0 if info.get("moving_good") else 0.0
                         )
                     stats_phases[phase] += 1
                     primitive_id = str(info.get("primitive_id", "unknown"))
                     stats_primitives[primitive_id] += 1
-                    if primitive_id in stats_primitive_xy and phase not in ("capture", "stopped"):
+                    if primitive_id in stats_primitive_xy and moving_track_eligible:
                         stats_primitive_xy[primitive_id].append(xy_err)
                         stats_primitive_z[primitive_id].append(z_err)
                         stats_primitive_velocity[primitive_id].append(tracking_vel_err)
+                        stats_primitive_xy_good[primitive_id].append(
+                            1.0 if info.get("moving_xy_good") else 0.0
+                        )
+                        stats_primitive_z_good[primitive_id].append(
+                            1.0 if info.get("moving_z_good") else 0.0
+                        )
+                        stats_primitive_velocity_good[primitive_id].append(
+                            1.0 if info.get("moving_velocity_good") else 0.0
+                        )
                         stats_primitive_good[primitive_id].append(
-                            1.0
-                            if xy_err <= args.moving_success_xy_tolerance_m
-                            and z_err <= args.tracking_z_tolerance_m
-                            and tracking_vel_err <= args.moving_success_velocity_tolerance_mps
-                            else 0.0
+                            1.0 if info.get("moving_good") else 0.0
                         )
                     stats_braking_progress.append(float(info.get("braking_progress", 0.0)))
                     if bool(info.get("target_stopped", False)):
@@ -988,26 +1087,19 @@ def main():
                             float(info.get("stopped_velocity_error", 0.0))
                         )
                         stats_stopped_xy_met.append(
-                            1.0
-                            if xy_err <= args.tracking_xy_tolerance_m
-                            else 0.0
+                            1.0 if info.get("stopped_xy_good") else 0.0
                         )
                         stats_stopped_z_met.append(
-                            1.0
-                            if z_err <= args.tracking_z_tolerance_m
-                            else 0.0
+                            1.0 if info.get("stopped_z_good") else 0.0
                         )
                         stats_stopped_position_met.append(
                             1.0
-                            if xy_err <= args.tracking_xy_tolerance_m
-                            and z_err <= args.tracking_z_tolerance_m
+                            if info.get("stopped_xy_good")
+                            and info.get("stopped_z_good")
                             else 0.0
                         )
                         stats_stopped_stationary.append(
-                            1.0
-                            if speed_xy <= args.stopped_speed_xy_tolerance_mps
-                            and speed_z <= args.stopped_speed_z_tolerance_mps
-                            else 0.0
+                            1.0 if info.get("stopped_speed_good") else 0.0
                         )
 
                     episode_step_counts[env_id] += 1
@@ -1102,8 +1194,37 @@ def main():
                             "moving_eligible_steps": int(info.get("moving_eligible_steps", 0)),
                             "moving_good_steps": int(info.get("moving_good_steps", 0)),
                             "moving_good_fraction": float(info.get("moving_good_fraction", 0.0)),
+                            "moving_xy_good_steps": int(info.get("moving_xy_good_steps", 0)),
+                            "moving_z_good_steps": int(info.get("moving_z_good_steps", 0)),
+                            "moving_velocity_good_steps": int(
+                                info.get("moving_velocity_good_steps", 0)
+                            ),
+                            "moving_xy_good_fraction": float(
+                                info.get("moving_xy_good_fraction", 0.0)
+                            ),
+                            "moving_z_good_fraction": float(
+                                info.get("moving_z_good_fraction", 0.0)
+                            ),
+                            "moving_velocity_good_fraction": float(
+                                info.get("moving_velocity_good_fraction", 0.0)
+                            ),
                             "stopped_track_dwell_steps": int(info.get("stopped_track_dwell_steps", 0)),
                             "required_stopped_track_steps": int(info.get("required_stopped_track_steps", 0)),
+                            "stopped_eligible_steps": int(info.get("stopped_eligible_steps", 0)),
+                            "stopped_xy_good_steps": int(info.get("stopped_xy_good_steps", 0)),
+                            "stopped_z_good_steps": int(info.get("stopped_z_good_steps", 0)),
+                            "stopped_speed_good_steps": int(
+                                info.get("stopped_speed_good_steps", 0)
+                            ),
+                            "stopped_xy_good_fraction": float(
+                                info.get("stopped_xy_good_fraction", 0.0)
+                            ),
+                            "stopped_z_good_fraction": float(
+                                info.get("stopped_z_good_fraction", 0.0)
+                            ),
+                            "stopped_speed_good_fraction": float(
+                                info.get("stopped_speed_good_fraction", 0.0)
+                            ),
                             "mean_goal_xy_err": float(episode_xy_sums[env_id] / episode_steps),
                             "max_goal_xy_err": float(episode_xy_max[env_id]),
                             "mean_z_err": float(episode_z_sums[env_id] / episode_steps),
@@ -1188,9 +1309,11 @@ def main():
                 actor_lr = args.lr
                 critic_lr = args.critic_lr
             for group in actor_optimizer.param_groups:
-                group["lr"] = actor_lr
+                group["lr"] = actor_lr * float(group.get("lr_multiplier", 1.0))
             for group in critic_optimizer.param_groups:
                 group["lr"] = critic_lr
+            actor_backbone_lr = actor_lr * args.actor_backbone_lr_multiplier
+            actor_recurrent_lr = actor_lr * args.actor_recurrent_lr_multiplier
             entropy_coef = (
                 args.entropy_coef
                 + schedule_progress * (args.entropy_coef_final - args.entropy_coef)
@@ -1360,6 +1483,30 @@ def main():
                     },
                     sort_keys=True,
                 ),
+                "primitive_xy_good_fraction": json.dumps(
+                    {
+                        key: float(np.mean(values))
+                        for key, values in stats_primitive_xy_good.items()
+                        if values
+                    },
+                    sort_keys=True,
+                ),
+                "primitive_z_good_fraction": json.dumps(
+                    {
+                        key: float(np.mean(values))
+                        for key, values in stats_primitive_z_good.items()
+                        if values
+                    },
+                    sort_keys=True,
+                ),
+                "primitive_velocity_good_fraction": json.dumps(
+                    {
+                        key: float(np.mean(values))
+                        for key, values in stats_primitive_velocity_good.items()
+                        if values
+                    },
+                    sort_keys=True,
+                ),
                 "primitive_good_fraction": json.dumps(
                     {
                         key: float(np.mean(values))
@@ -1372,7 +1519,14 @@ def main():
                 "clip_fraction": float(np.mean(clip_fractions)) if clip_fractions else 0.0,
                 "kl_early_stop": bool(kl_early_stop),
                 "actor_lr": float(actor_lr),
+                "actor_backbone_lr": float(actor_backbone_lr),
+                "actor_recurrent_lr": float(actor_recurrent_lr),
                 "critic_lr": float(critic_lr),
+                "temporal_gate_raw": float(policy.temporal_gate.detach().cpu()),
+                "temporal_gate_effective": float(
+                    torch.tanh(policy.temporal_gate).detach().cpu()
+                ),
+                "temporal_gate_frozen": bool(temporal_gate_frozen),
                 "entropy_coef_current": float(entropy_coef),
                 "explained_variance": explained_variance(value_pred, returns.reshape(-1)),
                 "action_mean": float(np.mean(actions_np)) if actions_np.size else 0.0,
@@ -1392,6 +1546,21 @@ def main():
                 "mean_moving_good_fraction": (
                     float(np.mean(stats_moving_good_fraction))
                     if stats_moving_good_fraction
+                    else 0.0
+                ),
+                "moving_xy_good_sample_fraction": (
+                    float(np.mean(stats_moving_xy_good_sample))
+                    if stats_moving_xy_good_sample
+                    else 0.0
+                ),
+                "moving_z_good_sample_fraction": (
+                    float(np.mean(stats_moving_z_good_sample))
+                    if stats_moving_z_good_sample
+                    else 0.0
+                ),
+                "moving_velocity_good_sample_fraction": (
+                    float(np.mean(stats_moving_velocity_good_sample))
+                    if stats_moving_velocity_good_sample
                     else 0.0
                 ),
                 "moving_good_sample_fraction": (
@@ -1439,6 +1608,17 @@ def main():
                 "stopped_stationary_fraction": (
                     float(np.mean(stats_stopped_stationary)) if stats_stopped_stationary else 0.0
                 ),
+                "stopped_xy_good_sample_fraction": (
+                    float(np.mean(stats_stopped_xy_met)) if stats_stopped_xy_met else 0.0
+                ),
+                "stopped_z_good_sample_fraction": (
+                    float(np.mean(stats_stopped_z_met)) if stats_stopped_z_met else 0.0
+                ),
+                "stopped_speed_good_sample_fraction": (
+                    float(np.mean(stats_stopped_stationary))
+                    if stats_stopped_stationary
+                    else 0.0
+                ),
                 "mean_braking_progress": (
                     float(np.mean(stats_braking_progress)) if stats_braking_progress else 0.0
                 ),
@@ -1477,6 +1657,13 @@ def main():
                 f"mean_moving_good_fraction: {update_row['mean_moving_good_fraction']:.3f}"
             )
             print(
+                "  moving_conditions: "
+                f"xy={update_row['moving_xy_good_sample_fraction']:.3f}, "
+                f"z={update_row['moving_z_good_sample_fraction']:.3f}, "
+                f"velocity={update_row['moving_velocity_good_sample_fraction']:.3f}, "
+                f"joint={update_row['moving_good_sample_fraction']:.3f}"
+            )
+            print(
                 f"  phases: capture={update_row['capture_phase_fraction']:.3f}, "
                 f"moving={update_row['moving_phase_fraction']:.3f}, "
                 f"decelerating={update_row['decelerating_phase_fraction']:.3f}, "
@@ -1508,9 +1695,16 @@ def main():
                 f"kl_early_stop: {update_row['kl_early_stop']}"
             )
             print(
-                f"  actor_lr: {update_row['actor_lr']:.7f}, "
+                f"  actor_lr: base={update_row['actor_lr']:.7f}, "
+                f"backbone={update_row['actor_backbone_lr']:.7f}, "
+                f"recurrent={update_row['actor_recurrent_lr']:.7f}, "
                 f"critic_lr: {update_row['critic_lr']:.7f}, "
                 f"entropy_coef: {update_row['entropy_coef_current']:.7f}"
+            )
+            print(
+                f"  temporal_gate: raw={update_row['temporal_gate_raw']:.6f}, "
+                f"effective={update_row['temporal_gate_effective']:.6f}, "
+                f"frozen={update_row['temporal_gate_frozen']}"
             )
             print(f"  explained_variance: {update_row['explained_variance']:.3f}, action_abs_mean: {update_row['action_abs_mean']:.3f}")
             print(
