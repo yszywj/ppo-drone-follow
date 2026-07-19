@@ -55,6 +55,9 @@ class PrimitiveTemplate:
     curvature_per_m: Tuple[float, float]
     min_abs_curvature_per_m: float
     vertical_speed_mps: Tuple[float, float]
+    min_heading_change_deg: float
+    min_vertical_displacement_m: float
+    min_speed_change_mps: float
 
     @classmethod
     def from_dict(cls, primitive_id: str, data: Mapping[str, Any]) -> "PrimitiveTemplate":
@@ -72,6 +75,15 @@ class PrimitiveTemplate:
             curvature_per_m=_range(data.get("curvature_per_m", 0.0), f"{primitive_id}.curvature_per_m"),
             min_abs_curvature_per_m=max(0.0, float(data.get("min_abs_curvature_per_m", 0.0))),
             vertical_speed_mps=_range(data.get("vertical_speed_mps", 0.0), f"{primitive_id}.vertical_speed_mps"),
+            min_heading_change_deg=max(
+                0.0, float(data.get("min_heading_change_deg", 0.0))
+            ),
+            min_vertical_displacement_m=max(
+                0.0, float(data.get("min_vertical_displacement_m", 0.0))
+            ),
+            min_speed_change_mps=max(
+                0.0, float(data.get("min_speed_change_mps", 0.0))
+            ),
         )
 
 
@@ -329,8 +341,15 @@ class MotionTaskGenerator:
         for _ in range(self.config.max_resample_attempts):
             sequence = self._sample_sequence(rng)
             trajectory = self._generate(rng, home, target_start, initial_heading_rad, sequence)
-            if self._within_limits(trajectory, home):
+            if not self._within_limits(trajectory, home):
+                last_error = "trajectory violated configured workspace limits"
+                continue
+            amplitudes_valid, amplitude_error = self._meets_template_amplitudes(
+                trajectory
+            )
+            if amplitudes_valid:
                 return trajectory
+            last_error = amplitude_error
         raise RuntimeError(last_error)
 
     def _sample_sequence(self, rng: np.random.Generator) -> Tuple[str, ...]:
@@ -640,3 +659,63 @@ class MotionTaskGenerator:
             and np.max(target_z) <= limits.max_vertical_displacement_m
             and np.max(goal_z) <= limits.max_vertical_displacement_m
         )
+
+    def _meets_template_amplitudes(
+        self,
+        trajectory: GeneratedTrajectory,
+    ) -> tuple[bool, str]:
+        horizontal_speeds = np.linalg.norm(trajectory.velocities[:, :2], axis=1)
+        for segment_index, primitive_id in enumerate(trajectory.sequence_ids):
+            template = self.config.templates[primitive_id]
+            if (
+                template.min_heading_change_deg <= 0.0
+                and template.min_vertical_displacement_m <= 0.0
+                and template.min_speed_change_mps <= 0.0
+            ):
+                continue
+            indices = np.flatnonzero(
+                trajectory.segment_indices == segment_index
+            )
+            if indices.size == 0:
+                return False, f"trajectory segment {segment_index} has no samples"
+            start_index = max(0, int(indices[0]) - 1)
+            end_index = int(indices[-1])
+
+            unwrapped_heading = np.unwrap(
+                trajectory.headings[start_index : end_index + 1]
+            )
+            heading_change_deg = abs(
+                math.degrees(float(unwrapped_heading[-1] - unwrapped_heading[0]))
+            )
+            vertical_displacement = abs(
+                float(
+                    trajectory.positions[end_index, 2]
+                    - trajectory.positions[start_index, 2]
+                )
+            )
+            speed_change = abs(
+                float(horizontal_speeds[end_index] - horizontal_speeds[start_index])
+            )
+            if heading_change_deg + 1e-6 < template.min_heading_change_deg:
+                return (
+                    False,
+                    f"{primitive_id} segment heading change {heading_change_deg:.2f}deg "
+                    f"is below {template.min_heading_change_deg:.2f}deg",
+                )
+            if (
+                vertical_displacement + 1e-6
+                < template.min_vertical_displacement_m
+            ):
+                return (
+                    False,
+                    f"{primitive_id} segment vertical displacement "
+                    f"{vertical_displacement:.3f}m is below "
+                    f"{template.min_vertical_displacement_m:.3f}m",
+                )
+            if speed_change + 1e-6 < template.min_speed_change_mps:
+                return (
+                    False,
+                    f"{primitive_id} segment speed change {speed_change:.3f}m/s "
+                    f"is below {template.min_speed_change_mps:.3f}m/s",
+                )
+        return True, ""

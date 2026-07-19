@@ -18,6 +18,12 @@ from pegasus.simulator.logic.interface.pegasus_interface import PegasusInterface
 from pegasus.simulator.logic.vehicles.multirotor import Multirotor, MultirotorConfig
 from pegasus.simulator.params import ROBOTS, SIMULATION_ENVIRONMENTS
 
+from .camera_geometry import (
+    CameraModelConfig,
+    CameraProjection,
+    CameraQualityWindow,
+    project_target_to_camera,
+)
 from .ctbr_backend import (
     CTBRActionLimits,
     GoalPoint,
@@ -71,6 +77,10 @@ REWARD_TERM_KEYS = [
     "reward_moving_good",
     "reward_local_tracking",
     "reward_local_drift",
+    "reward_camera_center",
+    "reward_camera_visible",
+    "reward_camera_lost",
+    "reward_camera_local",
     "reward_stopped_position",
     "reward_tilt",
     "reward_control",
@@ -100,15 +110,15 @@ class LineFollowTaskConfig:
     randomize_line_yaw: bool = False
     line_yaw_min_deg: float = -20.0
     line_yaw_max_deg: float = 20.0
-    tracking_xy_tolerance_m: float = 0.45
-    tracking_z_tolerance_m: float = 0.40
+    tracking_xy_tolerance_m: float = 0.30
+    tracking_z_tolerance_m: float = 0.30
     tracking_velocity_tolerance_mps: float = 0.45
     stopped_speed_xy_tolerance_mps: float = 0.25
     stopped_speed_z_tolerance_mps: float = 0.25
     moving_success_dwell_sec: float = 1.0
     moving_reward_min_progress_fraction: float = 0.20
     moving_success_min_fraction: float = 0.50
-    moving_success_xy_tolerance_m: float = 0.60
+    moving_success_xy_tolerance_m: float = 0.30
     moving_success_velocity_tolerance_mps: float = 0.35
     vertical_motion_z_tolerance_m: float = 0.30
     vertical_motion_velocity_tolerance_mps: float = 0.10
@@ -133,6 +143,26 @@ class LineFollowTaskConfig:
     local_tracking_drift_deadband_m: float = 0.05
     reward_local_tracking_scale: float = 0.0
     reward_local_drift_scale: float = 0.0
+    camera_tracking_enabled: bool = False
+    camera_horizontal_fov_deg: float = 90.0
+    camera_vertical_fov_deg: float = 60.0
+    camera_mount_roll_deg: float = 0.0
+    camera_mount_pitch_down_deg: float = 0.0
+    camera_mount_yaw_right_deg: float = 0.0
+    camera_near_clip_m: float = 0.10
+    camera_far_clip_m: float = 20.0
+    camera_success_margin: float = 0.90
+    camera_center_sigma_u: float = 0.50
+    camera_center_sigma_v: float = 0.50
+    camera_success_min_fraction: float = 0.90
+    camera_local_success_min_fraction: float = 0.80
+    camera_max_consecutive_lost_sec: float = 0.0
+    camera_window_sec: float = 2.0
+    camera_reward_interval_sec: float = 2.0
+    reward_camera_center_scale: float = 0.0
+    reward_camera_visible_scale: float = 0.0
+    reward_camera_lost_scale: float = 0.0
+    reward_camera_local_scale: float = 0.0
     max_tracking_error_m: float = 3.0
     min_target_distance_m: float = 0.35
     reward_position_scale: float = 2.0
@@ -195,6 +225,7 @@ class FastIrisLineFollowVecEnv:
     """Pegasus Iris vector environment for line following without PX4/MAVLink."""
 
     base_obs_dim = 32
+    camera_obs_dim = 6
     action_dim = 4
 
     def __init__(self, config: FastLineFollowEnvConfig, task_config: LineFollowTaskConfig):
@@ -203,13 +234,21 @@ class FastIrisLineFollowVecEnv:
         self.num_envs = int(config.num_envs)
         self.reference_horizon_sec = tuple(task_config.motion_pool.reference_horizon_sec)
         self.future_reference_dim = 3 * len(self.reference_horizon_sec)
-        self.obs_dim = self.base_obs_dim
+        self.obs_dim = self.base_obs_dim + (
+            self.camera_obs_dim if task_config.camera_tracking_enabled else 0
+        )
         self.local_tracking_privileged_dim = 6
-        self.privileged_obs_dim = (
+        self.base_privileged_obs_dim = (
             4
             + len(PRIMITIVE_CODES)
             + 16
             + self.local_tracking_privileged_dim
+        )
+        self.camera_privileged_obs_dim = (
+            6 if task_config.camera_tracking_enabled else 0
+        )
+        self.privileged_obs_dim = (
+            self.base_privileged_obs_dim + self.camera_privileged_obs_dim
         )
         self.critic_obs_dim = (
             self.obs_dim + self.future_reference_dim + self.privileged_obs_dim
@@ -243,6 +282,30 @@ class FastIrisLineFollowVecEnv:
             )
             for _ in range(self.num_envs)
         ]
+        self._camera_model_config = CameraModelConfig(
+            horizontal_fov_deg=task_config.camera_horizontal_fov_deg,
+            vertical_fov_deg=task_config.camera_vertical_fov_deg,
+            mount_roll_deg=task_config.camera_mount_roll_deg,
+            mount_pitch_down_deg=task_config.camera_mount_pitch_down_deg,
+            mount_yaw_right_deg=task_config.camera_mount_yaw_right_deg,
+            near_clip_m=task_config.camera_near_clip_m,
+            far_clip_m=task_config.camera_far_clip_m,
+            success_margin=task_config.camera_success_margin,
+            center_sigma_u=task_config.camera_center_sigma_u,
+            center_sigma_v=task_config.camera_center_sigma_v,
+        )
+        camera_window_steps = seconds_to_steps(
+            task_config.camera_window_sec,
+            config.step_dt_sim_sec,
+        )
+        camera_interval_steps = seconds_to_steps(
+            task_config.camera_reward_interval_sec,
+            config.step_dt_sim_sec,
+        )
+        self._camera_quality_windows = [
+            CameraQualityWindow(camera_window_steps, camera_interval_steps)
+            for _ in range(self.num_envs)
+        ]
         self._local_window_ready = np.zeros(self.num_envs, dtype=bool)
         self._local_window_event = np.zeros(self.num_envs, dtype=bool)
         self._local_soft_joint_quality = np.zeros(
@@ -258,6 +321,37 @@ class FastIrisLineFollowVecEnv:
             self.num_envs, dtype=np.float64
         )
         self._local_xy_drift_delta_m = np.zeros(
+            self.num_envs, dtype=np.float64
+        )
+        self._camera_projection: List[Optional[CameraProjection]] = [
+            None for _ in range(self.num_envs)
+        ]
+        self._camera_eligible_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._camera_visible_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._camera_good_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._camera_visible_fraction = np.zeros(
+            self.num_envs, dtype=np.float64
+        )
+        self._camera_good_fraction = np.zeros(self.num_envs, dtype=np.float64)
+        self._camera_consecutive_lost_steps = np.zeros(
+            self.num_envs, dtype=np.int64
+        )
+        self._camera_max_consecutive_lost_steps = np.zeros(
+            self.num_envs, dtype=np.int64
+        )
+        self._camera_success_met = np.zeros(self.num_envs, dtype=bool)
+        self._camera_window_ready = np.zeros(self.num_envs, dtype=bool)
+        self._camera_window_event = np.zeros(self.num_envs, dtype=bool)
+        self._camera_local_visible_fraction = np.zeros(
+            self.num_envs, dtype=np.float64
+        )
+        self._camera_local_good_fraction = np.zeros(
+            self.num_envs, dtype=np.float64
+        )
+        self._camera_local_center_quality = np.zeros(
+            self.num_envs, dtype=np.float64
+        )
+        self._camera_local_joint_quality = np.zeros(
             self.num_envs, dtype=np.float64
         )
         self._episode_id = np.zeros(self.num_envs, dtype=np.int64)
@@ -513,6 +607,24 @@ class FastIrisLineFollowVecEnv:
         self._local_velocity_good_fraction[env_id] = 0.0
         self._local_z_good_fraction[env_id] = 0.0
         self._local_xy_drift_delta_m[env_id] = 0.0
+        self._camera_projection[env_id] = None
+        self._camera_quality_windows[env_id].reset()
+        self._camera_eligible_steps[env_id] = 0
+        self._camera_visible_steps[env_id] = 0
+        self._camera_good_steps[env_id] = 0
+        self._camera_visible_fraction[env_id] = 0.0
+        self._camera_good_fraction[env_id] = 0.0
+        self._camera_consecutive_lost_steps[env_id] = 0
+        self._camera_max_consecutive_lost_steps[env_id] = 0
+        self._camera_success_met[env_id] = bool(
+            not self.task_config.camera_tracking_enabled
+        )
+        self._camera_window_ready[env_id] = False
+        self._camera_window_event[env_id] = False
+        self._camera_local_visible_fraction[env_id] = 0.0
+        self._camera_local_good_fraction[env_id] = 0.0
+        self._camera_local_center_quality[env_id] = 0.0
+        self._camera_local_joint_quality[env_id] = 0.0
         self._last_vertical_velocity_error[env_id] = 0.0
         self._vertical_eligible_steps[env_id] = 0
         self._vertical_good_steps[env_id] = 0
@@ -930,6 +1042,15 @@ class FastIrisLineFollowVecEnv:
             self.config.step_dt_sim_sec,
         )
 
+    @property
+    def max_camera_lost_steps(self) -> int:
+        if self.task_config.camera_max_consecutive_lost_sec <= 0.0:
+            return 0
+        return seconds_to_steps(
+            self.task_config.camera_max_consecutive_lost_sec,
+            self.config.step_dt_sim_sec,
+        )
+
     def step(self, actions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
         actions = np.asarray(actions, dtype=np.float32)
         if actions.shape != (self.num_envs, self.action_dim):
@@ -1032,7 +1153,11 @@ class FastIrisLineFollowVecEnv:
         controller_roll_raw = limits.attitude_feedback_scale * roll_fb
 
         yaw_target = self._yaw_target[env_id]
-        if yaw_target is None or limits.yaw_hold_kp <= 0.0:
+        if (
+            self.task_config.camera_tracking_enabled
+            or yaw_target is None
+            or limits.yaw_hold_kp <= 0.0
+        ):
             controller_yaw = 0.0
         else:
             yaw_error = wrap_angle_pi(yaw_target - float(obs.yaw))
@@ -1089,7 +1214,11 @@ class FastIrisLineFollowVecEnv:
             # Legacy mode retained so previous probe/training results remain reproducible.
             roll = controller_roll_raw + limits.residual_gain * pol_roll
             pitch = controller_pitch_raw + limits.residual_gain * pol_pitch
-            yaw = controller_yaw
+            yaw = (
+                controller_yaw + limits.residual_gain * pol_yaw
+                if self.task_config.camera_tracking_enabled
+                else controller_yaw
+            )
             thrust = (
                 limits.hover_thrust
                 + controller_thrust_delta
@@ -1161,6 +1290,38 @@ class FastIrisLineFollowVecEnv:
             yawspeed=float(rates_frd[2]),
         )
 
+    def _attitude_body_to_ned(self, env_id: int, obs: ObservationData) -> np.ndarray:
+        try:
+            quaternion = np.asarray(
+                self.vehicles[env_id].state.get_attitude_ned_frd(),
+                dtype=np.float64,
+            )
+            if quaternion.shape == (4,) and np.all(np.isfinite(quaternion)):
+                return quaternion
+        except Exception:
+            pass
+        return Rotation.from_euler(
+            "XYZ",
+            [obs.roll, obs.pitch, obs.yaw],
+            degrees=False,
+        ).as_quat()
+
+    def _project_camera_target(
+        self,
+        env_id: int,
+        obs: Optional[ObservationData] = None,
+    ) -> CameraProjection:
+        if obs is None:
+            obs = self._obs_data(env_id)
+        projection = project_target_to_camera(
+            [obs.x, obs.y, obs.z],
+            self._attitude_body_to_ned(env_id, obs),
+            self._target_pos_ned[env_id],
+            self._camera_model_config,
+        )
+        self._camera_projection[env_id] = projection
+        return projection
+
     def _build_obs_batch(self) -> np.ndarray:
         return np.stack([self._build_obs_one(env_id) for env_id in range(self.num_envs)], axis=0).astype(np.float32)
 
@@ -1182,6 +1343,16 @@ class FastIrisLineFollowVecEnv:
             action_limits=self.config.action_limits,
             yaw_reference=self._policy_yaw_reference[env_id],
         )
+        if self.task_config.camera_tracking_enabled:
+            camera_projection = self._project_camera_target(env_id, obs)
+            policy_obs = np.concatenate(
+                (
+                    policy_obs,
+                    camera_projection.actor_features(
+                        self.task_config.camera_far_clip_m
+                    ),
+                )
+            ).astype(np.float32)
         if policy_obs.shape != (self.obs_dim,):
             raise RuntimeError(
                 f"observation contract produced {policy_obs.shape}, expected ({self.obs_dim},)"
@@ -1208,10 +1379,24 @@ class FastIrisLineFollowVecEnv:
             ).astype(np.float32)
         else:
             future_reference = np.zeros((self.num_envs, 0), dtype=np.float32)
-        critic_obs = np.concatenate(
-            (actor_obs, future_reference, privileged),
-            axis=1,
-        ).astype(np.float32)
+        if self.task_config.camera_tracking_enabled:
+            # Preserve the exact legacy Critic column order so an 83-input
+            # checkpoint can be transplanted without semantic column shifts.
+            critic_obs = np.concatenate(
+                (
+                    actor_obs[:, : self.base_obs_dim],
+                    future_reference,
+                    privileged[:, : self.base_privileged_obs_dim],
+                    actor_obs[:, self.base_obs_dim :],
+                    privileged[:, self.base_privileged_obs_dim :],
+                ),
+                axis=1,
+            ).astype(np.float32)
+        else:
+            critic_obs = np.concatenate(
+                (actor_obs, future_reference, privileged),
+                axis=1,
+            ).astype(np.float32)
         if critic_obs.shape != (self.num_envs, self.critic_obs_dim):
             raise RuntimeError(
                 f"critic observation has shape {critic_obs.shape}, expected "
@@ -1274,14 +1459,38 @@ class FastIrisLineFollowVecEnv:
             ],
             dtype=np.float32,
         )
+        components = [
+            phase_one_hot,
+            primitive_one_hot,
+            scalars,
+            dynamics,
+            control_ratio,
+            local_tracking,
+        ]
+        if self.task_config.camera_tracking_enabled:
+            max_lost_denominator = max(
+                1,
+                self.max_camera_lost_steps
+                if self.max_camera_lost_steps > 0
+                else self._camera_eligible_steps[env_id],
+            )
+            components.append(
+                np.array(
+                    [
+                        float(self._camera_success_met[env_id]),
+                        self._camera_good_fraction[env_id],
+                        self._camera_visible_fraction[env_id],
+                        float(self._camera_window_ready[env_id]),
+                        self._camera_local_good_fraction[env_id],
+                        self._camera_max_consecutive_lost_steps[env_id]
+                        / float(max_lost_denominator),
+                    ],
+                    dtype=np.float32,
+                )
+            )
         privileged = np.concatenate(
             (
-                phase_one_hot,
-                primitive_one_hot,
-                scalars,
-                dynamics,
-                control_ratio,
-                local_tracking,
+                *components,
             )
         ).astype(np.float32)
         if privileged.shape != (self.privileged_obs_dim,):
@@ -1393,6 +1602,42 @@ class FastIrisLineFollowVecEnv:
         target_stopped = bool(status["target_stopped"])
         target_progress = float(self._target_progress_fraction[env_id])
         moving_track_eligible = target_progress >= float(self.task_config.moving_reward_min_progress_fraction)
+        camera_projection = self._project_camera_target(env_id, obs)
+        camera_visible = bool(camera_projection.visible)
+        camera_good = bool(camera_projection.success_region)
+        if self.task_config.camera_tracking_enabled:
+            self._camera_eligible_steps[env_id] += 1
+            self._camera_visible_steps[env_id] += int(camera_visible)
+            self._camera_good_steps[env_id] += int(camera_good)
+            camera_denominator = float(max(1, self._camera_eligible_steps[env_id]))
+            self._camera_visible_fraction[env_id] = (
+                float(self._camera_visible_steps[env_id]) / camera_denominator
+            )
+            self._camera_good_fraction[env_id] = (
+                float(self._camera_good_steps[env_id]) / camera_denominator
+            )
+            if camera_good:
+                self._camera_consecutive_lost_steps[env_id] = 0
+            else:
+                self._camera_consecutive_lost_steps[env_id] += 1
+                self._camera_max_consecutive_lost_steps[env_id] = max(
+                    self._camera_max_consecutive_lost_steps[env_id],
+                    self._camera_consecutive_lost_steps[env_id],
+                )
+            lost_streak_met = bool(
+                self.max_camera_lost_steps <= 0
+                or self._camera_max_consecutive_lost_steps[env_id]
+                <= self.max_camera_lost_steps
+            )
+            self._camera_success_met[env_id] = bool(
+                self._camera_good_fraction[env_id]
+                >= self.task_config.camera_success_min_fraction
+                and lost_streak_met
+            )
+        else:
+            camera_visible = True
+            camera_good = True
+            self._camera_success_met[env_id] = True
         capture_entered_now = False
         capture_acquired_now = False
         capture_position_inside = False
@@ -1435,6 +1680,7 @@ class FastIrisLineFollowVecEnv:
                 capture_position_inside
                 and speed_xy <= self.task_config.tracking_velocity_tolerance_mps
                 and speed_z <= self.task_config.stopped_speed_z_tolerance_mps
+                and camera_good
             )
             if capture_position_inside and not self._capture_entered[env_id]:
                 capture_entered_now = True
@@ -1477,7 +1723,12 @@ class FastIrisLineFollowVecEnv:
             self._stopped_speed_good_fraction[env_id] = (
                 float(self._stopped_speed_good_steps[env_id]) / stopped_denominator
             )
-            self._stopped_track_dwell_steps[env_id] = self._stopped_track_dwell_steps[env_id] + 1 if status["inside"] else 0
+            stopped_inside = bool(status["inside"]) and camera_good
+            self._stopped_track_dwell_steps[env_id] = (
+                self._stopped_track_dwell_steps[env_id] + 1
+                if stopped_inside
+                else 0
+            )
             self._goal_dwell_steps[env_id] = self._stopped_track_dwell_steps[env_id]
             self._goal_dwell_fraction[env_id] = min(
                 1.0,
@@ -1580,7 +1831,7 @@ class FastIrisLineFollowVecEnv:
         if not self._capture_acquired[env_id] or capture_acquired_now:
             self._inside_goal_zone[env_id] = bool(capture_inside)
         else:
-            self._inside_goal_zone[env_id] = bool(status["inside"]) and (
+            self._inside_goal_zone[env_id] = bool(status["inside"]) and camera_good and (
                 target_stopped or moving_track_eligible
             )
 
@@ -1646,8 +1897,10 @@ class FastIrisLineFollowVecEnv:
             and not target_stopped
         )
         self._local_window_event[env_id] = False
+        self._camera_window_event[env_id] = False
         reward_local_tracking = 0.0
         reward_local_drift = 0.0
+        reward_camera_local = 0.0
         if moving_reward_active:
             local_snapshot = self._tracking_quality_windows[env_id].append(
                 xy_err,
@@ -1679,15 +1932,80 @@ class FastIrisLineFollowVecEnv:
                 self.task_config.reward_local_tracking_scale,
                 self.task_config.reward_local_drift_scale,
             )
+            if self.task_config.camera_tracking_enabled:
+                camera_snapshot = self._camera_quality_windows[env_id].append(
+                    camera_projection.visible,
+                    camera_projection.success_region,
+                    camera_projection.center_quality,
+                )
+                self._camera_window_ready[env_id] = camera_snapshot.ready
+                self._camera_window_event[env_id] = camera_snapshot.reward_event
+                self._camera_local_visible_fraction[env_id] = (
+                    camera_snapshot.visible_fraction
+                )
+                self._camera_local_good_fraction[env_id] = (
+                    camera_snapshot.success_fraction
+                )
+                self._camera_local_center_quality[env_id] = (
+                    camera_snapshot.mean_center_quality
+                )
+                self._camera_local_joint_quality[env_id] = (
+                    camera_snapshot.joint_quality
+                )
+                if local_snapshot.reward_event:
+                    local_camera_success = bool(
+                        camera_snapshot.ready
+                        and camera_snapshot.success_fraction
+                        >= self.task_config.camera_local_success_min_fraction
+                    )
+                    if local_camera_success:
+                        center_multiplier = (
+                            0.5 + 0.5 * camera_snapshot.mean_center_quality
+                        )
+                        reward_local_tracking *= center_multiplier
+                        reward_camera_local = (
+                            self.task_config.reward_camera_local_scale
+                            * local_snapshot.soft_joint_quality
+                            * camera_snapshot.joint_quality
+                        )
+                    else:
+                        reward_local_tracking = 0.0
         vertical_requirement_met = bool(
             self._vertical_eligible_steps[env_id] == 0
             or self._vertical_success_met[env_id]
+        )
+        camera_requirement_met = bool(
+            not self.task_config.camera_tracking_enabled
+            or self._camera_success_met[env_id]
         )
         stopped_reward_active = (
             self._capture_acquired[env_id]
             and target_stopped
             and self._moving_success_met[env_id]
             and vertical_requirement_met
+            and camera_requirement_met
+        )
+        reward_camera_center = (
+            dense_scale
+            * self.task_config.reward_camera_center_scale
+            * camera_projection.center_quality
+            if self.task_config.camera_tracking_enabled
+            else 0.0
+        )
+        reward_camera_visible = (
+            dense_scale
+            * self.task_config.reward_camera_visible_scale
+            * float(camera_projection.visible)
+            if self.task_config.camera_tracking_enabled
+            else 0.0
+        )
+        reward_camera_lost = (
+            -dense_scale
+            * self.task_config.reward_camera_lost_scale
+            * (1.0 - camera_projection.center_quality)
+            if self.task_config.camera_tracking_enabled
+            and not camera_projection.success_region
+            else 0.0
         )
         reward_alive = dense_scale * self.config.reward_alive
         reward_time = (
@@ -1871,10 +2189,26 @@ class FastIrisLineFollowVecEnv:
 
         if (
             not done
+            and target_stopped
+            and self._capture_acquired[env_id]
+            and self._moving_success_met[env_id]
+            and vertical_requirement_met
+            and self.task_config.camera_tracking_enabled
+            and not self._camera_success_met[env_id]
+            and self._stopped_track_dwell_steps[env_id]
+            >= self.required_stopped_track_steps
+        ):
+            done = True
+            done_reason = "camera_success_failed"
+            reward_timeout = self.config.reward_timeout
+
+        if (
+            not done
             and bool(status["target_stopped"])
             and self._capture_acquired[env_id]
             and self._moving_success_met[env_id]
             and vertical_requirement_met
+            and camera_requirement_met
             and self._stopped_track_dwell_steps[env_id] >= self.required_stopped_track_steps
         ):
             done = True
@@ -1902,6 +2236,10 @@ class FastIrisLineFollowVecEnv:
             + reward_moving_good
             + reward_local_tracking
             + reward_local_drift
+            + reward_camera_center
+            + reward_camera_visible
+            + reward_camera_lost
+            + reward_camera_local
             + reward_stopped_position
             + reward_tilt
             + reward_control
@@ -1928,6 +2266,10 @@ class FastIrisLineFollowVecEnv:
             "reward_moving_good": float(reward_moving_good),
             "reward_local_tracking": float(reward_local_tracking),
             "reward_local_drift": float(reward_local_drift),
+            "reward_camera_center": float(reward_camera_center),
+            "reward_camera_visible": float(reward_camera_visible),
+            "reward_camera_lost": float(reward_camera_lost),
+            "reward_camera_local": float(reward_camera_local),
             "reward_stopped_position": float(reward_stopped_position),
             "reward_tilt": float(reward_tilt),
             "reward_control": float(reward_control),
@@ -1942,6 +2284,23 @@ class FastIrisLineFollowVecEnv:
 
     def _build_info(self, env_id: int, done_reason: str) -> Dict[str, Any]:
         obs = self._obs_data(env_id)
+        camera_projection = self._project_camera_target(env_id, obs)
+        camera_u = float(
+            np.nan_to_num(
+                camera_projection.normalized_u,
+                nan=0.0,
+                posinf=10.0,
+                neginf=-10.0,
+            )
+        )
+        camera_v = float(
+            np.nan_to_num(
+                camera_projection.normalized_v,
+                nan=0.0,
+                posinf=10.0,
+                neginf=-10.0,
+            )
+        )
         goal = self._goal[env_id]
         home = self._home[env_id]
         xy_err = math.sqrt((obs.x - goal.x) ** 2 + (obs.y - goal.y) ** 2)
@@ -2025,6 +2384,67 @@ class FastIrisLineFollowVecEnv:
             "yaw_error": yaw_error,
             "max_abs_yaw_error": float(self._max_abs_yaw_error[env_id]),
             "policy_yaw_reference": self._policy_yaw_reference[env_id],
+            "camera_tracking_enabled": bool(
+                self.task_config.camera_tracking_enabled
+            ),
+            "camera_x_m": float(camera_projection.camera_x_m),
+            "camera_y_m": float(camera_projection.camera_y_m),
+            "camera_z_m": float(camera_projection.camera_z_m),
+            "camera_range_m": float(camera_projection.range_m),
+            "camera_normalized_u": camera_u,
+            "camera_normalized_v": camera_v,
+            "camera_bearing_rad": float(camera_projection.bearing_rad),
+            "camera_elevation_rad": float(camera_projection.elevation_rad),
+            "camera_in_front": bool(camera_projection.in_front),
+            "camera_visible": bool(camera_projection.visible),
+            "camera_good": bool(camera_projection.success_region),
+            "camera_center_quality": float(camera_projection.center_quality),
+            "camera_success_met": bool(self._camera_success_met[env_id]),
+            "camera_eligible_steps": int(self._camera_eligible_steps[env_id]),
+            "camera_visible_steps": int(self._camera_visible_steps[env_id]),
+            "camera_good_steps": int(self._camera_good_steps[env_id]),
+            "camera_visible_fraction": float(
+                self._camera_visible_fraction[env_id]
+            ),
+            "camera_good_fraction": float(self._camera_good_fraction[env_id]),
+            "camera_consecutive_lost_steps": int(
+                self._camera_consecutive_lost_steps[env_id]
+            ),
+            "camera_max_consecutive_lost_steps": int(
+                self._camera_max_consecutive_lost_steps[env_id]
+            ),
+            "camera_max_consecutive_lost_sec": float(
+                self._camera_max_consecutive_lost_steps[env_id]
+                * self.config.step_dt_sim_sec
+            ),
+            "camera_success_min_fraction": float(
+                self.task_config.camera_success_min_fraction
+            ),
+            "camera_window_ready": bool(self._camera_window_ready[env_id]),
+            "camera_window_reward_event": bool(
+                self._camera_window_event[env_id]
+            ),
+            "camera_local_visible_fraction": float(
+                self._camera_local_visible_fraction[env_id]
+            ),
+            "camera_local_good_fraction": float(
+                self._camera_local_good_fraction[env_id]
+            ),
+            "camera_local_center_quality": float(
+                self._camera_local_center_quality[env_id]
+            ),
+            "camera_local_joint_quality": float(
+                self._camera_local_joint_quality[env_id]
+            ),
+            "camera_horizontal_fov_deg": float(
+                self.task_config.camera_horizontal_fov_deg
+            ),
+            "camera_vertical_fov_deg": float(
+                self.task_config.camera_vertical_fov_deg
+            ),
+            "camera_success_margin": float(
+                self.task_config.camera_success_margin
+            ),
             "cmd_roll_rate": float(self._prev_action[env_id, 0]),
             "cmd_pitch_rate": float(self._prev_action[env_id, 1]),
             "cmd_yaw_rate": float(self._prev_action[env_id, 2]),

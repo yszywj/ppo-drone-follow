@@ -127,6 +127,8 @@ def parse_args():
     parser.add_argument("--deterministic_actions", action="store_true", default=False)
     parser.add_argument("--save_interval", type=int, default=10)
     parser.add_argument("--best_checkpoint_window", type=int, default=0)
+    parser.add_argument("--best_checkpoint_min_episodes", type=int, default=8)
+    parser.add_argument("--best_checkpoint_guardrail_drop", type=float, default=0.08)
     parser.add_argument("--early_stop_patience_updates", type=int, default=0)
     parser.add_argument("--early_stop_drop_threshold", type=float, default=0.0)
 
@@ -231,15 +233,15 @@ def parse_args():
     parser.add_argument("--line_yaw_min_deg", type=float, default=-20.0)
     parser.add_argument("--line_yaw_max_deg", type=float, default=20.0)
 
-    parser.add_argument("--tracking_xy_tolerance_m", type=float, default=0.45)
-    parser.add_argument("--tracking_z_tolerance_m", type=float, default=0.40)
+    parser.add_argument("--tracking_xy_tolerance_m", type=float, default=0.30)
+    parser.add_argument("--tracking_z_tolerance_m", type=float, default=0.30)
     parser.add_argument("--tracking_velocity_tolerance_mps", type=float, default=0.45)
     parser.add_argument("--stopped_speed_xy_tolerance_mps", type=float, default=0.25)
     parser.add_argument("--stopped_speed_z_tolerance_mps", type=float, default=0.25)
     parser.add_argument("--moving_success_dwell_sec", type=float, default=1.0)
     parser.add_argument("--moving_reward_min_progress_fraction", type=float, default=0.20)
     parser.add_argument("--moving_success_min_fraction", type=float, default=0.50)
-    parser.add_argument("--moving_success_xy_tolerance_m", type=float, default=0.60)
+    parser.add_argument("--moving_success_xy_tolerance_m", type=float, default=0.30)
     parser.add_argument("--moving_success_velocity_tolerance_mps", type=float, default=0.35)
     parser.add_argument("--vertical_motion_z_tolerance_m", type=float, default=0.30)
     parser.add_argument(
@@ -276,6 +278,38 @@ def parse_args():
     )
     parser.add_argument("--reward_local_tracking_scale", type=float, default=0.0)
     parser.add_argument("--reward_local_drift_scale", type=float, default=0.0)
+    parser.add_argument(
+        "--camera_tracking_enabled", action="store_true", default=False
+    )
+    parser.add_argument(
+        "--no_camera_tracking",
+        action="store_false",
+        dest="camera_tracking_enabled",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument("--camera_horizontal_fov_deg", type=float, default=90.0)
+    parser.add_argument("--camera_vertical_fov_deg", type=float, default=60.0)
+    parser.add_argument("--camera_mount_roll_deg", type=float, default=0.0)
+    parser.add_argument("--camera_mount_pitch_down_deg", type=float, default=0.0)
+    parser.add_argument("--camera_mount_yaw_right_deg", type=float, default=0.0)
+    parser.add_argument("--camera_near_clip_m", type=float, default=0.10)
+    parser.add_argument("--camera_far_clip_m", type=float, default=20.0)
+    parser.add_argument("--camera_success_margin", type=float, default=0.90)
+    parser.add_argument("--camera_center_sigma_u", type=float, default=0.50)
+    parser.add_argument("--camera_center_sigma_v", type=float, default=0.50)
+    parser.add_argument("--camera_success_min_fraction", type=float, default=0.90)
+    parser.add_argument(
+        "--camera_local_success_min_fraction", type=float, default=0.80
+    )
+    parser.add_argument(
+        "--camera_max_consecutive_lost_sec", type=float, default=0.0
+    )
+    parser.add_argument("--camera_window_sec", type=float, default=2.0)
+    parser.add_argument("--camera_reward_interval_sec", type=float, default=2.0)
+    parser.add_argument("--reward_camera_center_scale", type=float, default=0.0)
+    parser.add_argument("--reward_camera_visible_scale", type=float, default=0.0)
+    parser.add_argument("--reward_camera_lost_scale", type=float, default=0.0)
+    parser.add_argument("--reward_camera_local_scale", type=float, default=0.0)
     parser.add_argument("--max_tracking_error_m", type=float, default=3.0)
     parser.add_argument("--min_target_distance_m", type=float, default=0.35)
 
@@ -348,7 +382,11 @@ def parse_args():
         parser.error("--recurrent_hidden_size must be positive")
     if args.temporal_gate_warmup_updates < 0:
         parser.error("--temporal_gate_warmup_updates must be non-negative")
-    for name in ("best_checkpoint_window", "early_stop_patience_updates"):
+    for name in (
+        "best_checkpoint_window",
+        "best_checkpoint_min_episodes",
+        "early_stop_patience_updates",
+    ):
         if getattr(args, name) < 0:
             parser.error(f"--{name} must be non-negative")
     if args.early_stop_patience_updates > 0 and args.best_checkpoint_window <= 0:
@@ -396,6 +434,17 @@ def parse_args():
         "local_tracking_drift_deadband_m",
         "reward_local_tracking_scale",
         "reward_local_drift_scale",
+        "camera_near_clip_m",
+        "camera_far_clip_m",
+        "camera_center_sigma_u",
+        "camera_center_sigma_v",
+        "camera_max_consecutive_lost_sec",
+        "camera_window_sec",
+        "camera_reward_interval_sec",
+        "reward_camera_center_scale",
+        "reward_camera_visible_scale",
+        "reward_camera_lost_scale",
+        "reward_camera_local_scale",
         "reward_stop_speed_scale",
         "reward_braking_scale",
         "reward_stop_overspeed_scale",
@@ -429,6 +478,7 @@ def parse_args():
         "reward_tilt_scale",
         "reward_control_scale",
         "early_stop_drop_threshold",
+        "best_checkpoint_guardrail_drop",
         "goal_xy_pos_gain",
         "xy_velocity_damping_gain",
         "xy_target_velocity_gain",
@@ -449,11 +499,30 @@ def parse_args():
         "moving_reward_min_progress_fraction",
         "moving_success_min_fraction",
         "vertical_success_min_fraction",
+        "camera_success_margin",
+        "camera_success_min_fraction",
+        "camera_local_success_min_fraction",
     ):
         if getattr(args, name) > 1.0:
             parser.error(f"--{name} must be in [0, 1]")
     if not 0.0 <= args.target_accel_observation_filter_alpha <= 1.0:
         parser.error("--target_accel_observation_filter_alpha must be in [0, 1]")
+    if not 0.0 < args.camera_horizontal_fov_deg < 180.0:
+        parser.error("--camera_horizontal_fov_deg must be in (0, 180)")
+    if not 0.0 < args.camera_vertical_fov_deg < 180.0:
+        parser.error("--camera_vertical_fov_deg must be in (0, 180)")
+    if args.camera_far_clip_m <= args.camera_near_clip_m:
+        parser.error("--camera_far_clip_m must exceed --camera_near_clip_m")
+    if args.camera_success_margin <= 0.0:
+        parser.error("--camera_success_margin must be in (0, 1]")
+    if args.camera_success_min_fraction < 0.0:
+        parser.error("--camera_success_min_fraction must be in [0, 1]")
+    if args.camera_local_success_min_fraction < 0.0:
+        parser.error("--camera_local_success_min_fraction must be in [0, 1]")
+    if args.camera_window_sec <= 0.0 or args.camera_reward_interval_sec <= 0.0:
+        parser.error("camera window and reward interval must be positive")
+    if args.camera_center_sigma_u <= 0.0 or args.camera_center_sigma_v <= 0.0:
+        parser.error("camera center sigmas must be positive")
     if args.line_length_min_m > args.line_length_max_m:
         parser.error("--line_length_min_m must be <= --line_length_max_m")
     if args.reward_stopped_time_penalty > 0.0:
@@ -477,6 +546,12 @@ def main():
     import numpy as np
     import torch
 
+    from pegasus_iris_fast_line_follow.checkpoint_scoring import (
+        CheckpointScoreConfig,
+        aggregate_checkpoint_score,
+        checkpoint_score_formula,
+        violates_checkpoint_guardrails,
+    )
     from pegasus_iris_fast_line_follow.ctbr_backend import CTBRActionLimits, RotorCTBRBackendConfig, SafetyLimits
     from pegasus_iris_fast_line_follow.fast_line_follow_env import (
         FastIrisLineFollowVecEnv,
@@ -678,6 +753,30 @@ def main():
         ),
         reward_local_tracking_scale=args.reward_local_tracking_scale,
         reward_local_drift_scale=args.reward_local_drift_scale,
+        camera_tracking_enabled=args.camera_tracking_enabled,
+        camera_horizontal_fov_deg=args.camera_horizontal_fov_deg,
+        camera_vertical_fov_deg=args.camera_vertical_fov_deg,
+        camera_mount_roll_deg=args.camera_mount_roll_deg,
+        camera_mount_pitch_down_deg=args.camera_mount_pitch_down_deg,
+        camera_mount_yaw_right_deg=args.camera_mount_yaw_right_deg,
+        camera_near_clip_m=args.camera_near_clip_m,
+        camera_far_clip_m=args.camera_far_clip_m,
+        camera_success_margin=args.camera_success_margin,
+        camera_center_sigma_u=args.camera_center_sigma_u,
+        camera_center_sigma_v=args.camera_center_sigma_v,
+        camera_success_min_fraction=args.camera_success_min_fraction,
+        camera_local_success_min_fraction=(
+            args.camera_local_success_min_fraction
+        ),
+        camera_max_consecutive_lost_sec=(
+            args.camera_max_consecutive_lost_sec
+        ),
+        camera_window_sec=args.camera_window_sec,
+        camera_reward_interval_sec=args.camera_reward_interval_sec,
+        reward_camera_center_scale=args.reward_camera_center_scale,
+        reward_camera_visible_scale=args.reward_camera_visible_scale,
+        reward_camera_lost_scale=args.reward_camera_lost_scale,
+        reward_camera_local_scale=args.reward_camera_local_scale,
         max_tracking_error_m=args.max_tracking_error_m,
         min_target_distance_m=args.min_target_distance_m,
         reward_position_scale=args.reward_position_scale,
@@ -745,7 +844,16 @@ def main():
         "success_count",
         "timeout_count",
         "other_done_count",
+        "completed_episode_count",
+        "overall_success_rate",
+        "timeout_rate",
+        "other_failure_rate",
+        "mean_completed_final_xy_err",
+        "final_xy_quality",
+        "final_stop_good_fraction",
         "checkpoint_score",
+        "checkpoint_window_completed_episodes",
+        "checkpoint_guardrail_violated",
         "best_checkpoint_score",
         "best_checkpoint_update",
         "degradation_updates",
@@ -792,10 +900,13 @@ def main():
         "cmd_thrust_saturation_fraction",
         "mean_abs_policy_cmd_roll_rate",
         "mean_abs_policy_cmd_pitch_rate",
+        "mean_abs_policy_cmd_yaw_rate",
         "mean_abs_controller_cmd_roll_rate",
         "mean_abs_controller_cmd_pitch_rate",
+        "mean_abs_controller_cmd_yaw_rate",
         "mean_abs_final_cmd_roll_rate",
         "mean_abs_final_cmd_pitch_rate",
+        "mean_abs_final_cmd_yaw_rate",
         "mean_target_speed",
         "mean_tracking_velocity_error",
         "mean_reward_velocity_error",
@@ -817,6 +928,19 @@ def main():
         "mean_local_tracking_velocity_good_fraction",
         "mean_local_tracking_z_good_fraction",
         "mean_local_tracking_xy_drift_delta_m",
+        "camera_visible_sample_fraction",
+        "camera_good_sample_fraction",
+        "mean_camera_center_quality",
+        "mean_abs_camera_bearing_rad",
+        "mean_abs_camera_elevation_rad",
+        "camera_success_met_fraction",
+        "mean_camera_visible_fraction",
+        "mean_camera_good_fraction",
+        "camera_local_ready_fraction",
+        "camera_local_event_count",
+        "mean_camera_local_good_fraction",
+        "mean_camera_local_center_quality",
+        "mean_camera_max_consecutive_lost_sec",
         "vertical_success_met_fraction",
         "mean_vertical_good_fraction",
         "vertical_position_good_sample_fraction",
@@ -864,6 +988,24 @@ def main():
         "final_yaw",
         "final_yaw_rate",
         "yaw_start",
+        "final_camera_visible",
+        "final_camera_good",
+        "final_camera_normalized_u",
+        "final_camera_normalized_v",
+        "final_camera_bearing_rad",
+        "final_camera_elevation_rad",
+        "final_camera_center_quality",
+        "camera_success_met",
+        "camera_eligible_steps",
+        "camera_visible_steps",
+        "camera_good_steps",
+        "camera_visible_fraction",
+        "camera_good_fraction",
+        "camera_max_consecutive_lost_sec",
+        "camera_local_visible_fraction",
+        "camera_local_good_fraction",
+        "camera_local_center_quality",
+        "camera_local_joint_quality",
         "final_cmd_roll_rate",
         "final_cmd_pitch_rate",
         "final_cmd_yaw_rate",
@@ -987,6 +1129,26 @@ def main():
             f"actor_obs={env.obs_dim}, critic_obs={env.critic_obs_dim}",
             flush=True,
         )
+        print(
+            "[FAST PPO] success tolerances: "
+            f"moving_xy={args.moving_success_xy_tolerance_m:.3f}m, "
+            f"stopped_xy={args.tracking_xy_tolerance_m:.3f}m, "
+            f"z={args.tracking_z_tolerance_m:.3f}m, "
+            f"vertical_z={args.vertical_motion_z_tolerance_m:.3f}m",
+            flush=True,
+        )
+        if args.camera_tracking_enabled:
+            print(
+                "[FAST PPO] forward camera gate: "
+                f"target=physical target, FOV="
+                f"{args.camera_horizontal_fov_deg:.1f}x"
+                f"{args.camera_vertical_fov_deg:.1f}deg, "
+                f"success_margin={args.camera_success_margin:.2f}, "
+                f"episode_fraction>={args.camera_success_min_fraction:.2f}, "
+                f"local_fraction>={args.camera_local_success_min_fraction:.2f}; "
+                "task yaw helper disabled",
+                flush=True,
+            )
         print(f"[FAST PPO] initializing ActorCritic on {device}...", flush=True)
         policy = ActorCritic(
             env.obs_dim,
@@ -1039,6 +1201,11 @@ def main():
                 parameter.requires_grad_(False)
             print(
                 "[FAST PPO] Actor GRU residual branch frozen at "
+                f"effective_gate={float(torch.tanh(policy.temporal_gate)):.6f}"
+            )
+        else:
+            print(
+                "[FAST PPO] Actor GRU residual branch trainable at "
                 f"effective_gate={float(torch.tanh(policy.temporal_gate)):.6f}"
             )
 
@@ -1280,6 +1447,12 @@ def main():
         episode_start = np.ones(args.num_envs, dtype=bool)
         best_checkpoint_score = -math.inf
         best_checkpoint_update = 0
+        best_checkpoint_components = {}
+        checkpoint_score_config = CheckpointScoreConfig(
+            final_xy_tolerance_m=args.tracking_xy_tolerance_m,
+            camera_enabled=args.camera_tracking_enabled,
+            guardrail_drop=args.best_checkpoint_guardrail_drop,
+        )
         degradation_updates = 0
         while total_steps < args.num_env_steps:
             if (
@@ -1341,6 +1514,20 @@ def main():
             stats_local_tracking_velocity_fraction = []
             stats_local_tracking_z_fraction = []
             stats_local_tracking_drift = []
+            stats_camera_visible_sample = []
+            stats_camera_good_sample = []
+            stats_camera_center_quality = []
+            stats_camera_abs_bearing = []
+            stats_camera_abs_elevation = []
+            stats_camera_success_met = []
+            stats_camera_visible_fraction = []
+            stats_camera_good_fraction = []
+            stats_camera_local_ready = []
+            stats_camera_local_events = []
+            stats_camera_local_good_fraction = []
+            stats_camera_local_center_quality = []
+            stats_camera_max_lost_sec = []
+            stats_completed_final_xy = []
             stats_cmd_saturation = {
                 key: [] for key in ("any", "roll", "pitch", "yaw", "thrust")
             }
@@ -1349,10 +1536,13 @@ def main():
                 for key in (
                     "policy_roll",
                     "policy_pitch",
+                    "policy_yaw",
                     "controller_roll",
                     "controller_pitch",
+                    "controller_yaw",
                     "final_roll",
                     "final_pitch",
+                    "final_yaw",
                 )
             }
             stats_vertical_met = []
@@ -1509,6 +1699,61 @@ def main():
                         )
                     if info.get("local_tracking_reward_event", False):
                         stats_local_tracking_events.append(1.0)
+                    if bool(info.get("camera_tracking_enabled", False)):
+                        stats_camera_visible_sample.append(
+                            1.0 if info.get("camera_visible", False) else 0.0
+                        )
+                        stats_camera_good_sample.append(
+                            1.0 if info.get("camera_good", False) else 0.0
+                        )
+                        stats_camera_center_quality.append(
+                            float(info.get("camera_center_quality", 0.0))
+                        )
+                        stats_camera_abs_bearing.append(
+                            abs(float(info.get("camera_bearing_rad", 0.0)))
+                        )
+                        stats_camera_abs_elevation.append(
+                            abs(float(info.get("camera_elevation_rad", 0.0)))
+                        )
+                        stats_camera_success_met.append(
+                            1.0 if info.get("camera_success_met", False) else 0.0
+                        )
+                        stats_camera_visible_fraction.append(
+                            float(info.get("camera_visible_fraction", 0.0))
+                        )
+                        stats_camera_good_fraction.append(
+                            float(info.get("camera_good_fraction", 0.0))
+                        )
+                        camera_local_ready = bool(
+                            info.get("camera_window_ready", False)
+                        )
+                        stats_camera_local_ready.append(
+                            1.0 if camera_local_ready else 0.0
+                        )
+                        if camera_local_ready:
+                            stats_camera_local_good_fraction.append(
+                                float(
+                                    info.get(
+                                        "camera_local_good_fraction", 0.0
+                                    )
+                                )
+                            )
+                            stats_camera_local_center_quality.append(
+                                float(
+                                    info.get(
+                                        "camera_local_center_quality", 0.0
+                                    )
+                                )
+                            )
+                        if info.get("camera_window_reward_event", False):
+                            stats_camera_local_events.append(1.0)
+                        stats_camera_max_lost_sec.append(
+                            float(
+                                info.get(
+                                    "camera_max_consecutive_lost_sec", 0.0
+                                )
+                            )
+                        )
                     stats_cmd_saturation["any"].append(
                         1.0 if info.get("cmd_any_saturated", False) else 0.0
                     )
@@ -1524,17 +1769,26 @@ def main():
                     stats_abs_commands["policy_pitch"].append(
                         abs(float(info.get("policy_cmd_pitch_rate", 0.0)))
                     )
+                    stats_abs_commands["policy_yaw"].append(
+                        abs(float(info.get("policy_cmd_yaw_rate", 0.0)))
+                    )
                     stats_abs_commands["controller_roll"].append(
                         abs(float(info.get("controller_cmd_roll_rate", 0.0)))
                     )
                     stats_abs_commands["controller_pitch"].append(
                         abs(float(info.get("controller_cmd_pitch_rate", 0.0)))
                     )
+                    stats_abs_commands["controller_yaw"].append(
+                        abs(float(info.get("controller_cmd_yaw_rate", 0.0)))
+                    )
                     stats_abs_commands["final_roll"].append(
                         abs(float(info.get("cmd_roll_rate", 0.0)))
                     )
                     stats_abs_commands["final_pitch"].append(
                         abs(float(info.get("cmd_pitch_rate", 0.0)))
+                    )
+                    stats_abs_commands["final_yaw"].append(
+                        abs(float(info.get("cmd_yaw_rate", 0.0)))
                     )
                     moving_track_eligible = bool(info.get("moving_track_eligible", False))
                     if moving_track_eligible:
@@ -1656,6 +1910,7 @@ def main():
                         stats_reward_terms[key].append(reward_value)
                         episode_reward_returns[key][env_id] += reward_value
                     if dones[env_id]:
+                        stats_completed_final_xy.append(xy_err)
                         episode_steps = max(1, int(episode_step_counts[env_id]))
                         row = {
                             "episode": int(info.get("episode_id", 0)),
@@ -1676,6 +1931,62 @@ def main():
                             "final_yaw": float(info.get("yaw", 0.0)),
                             "final_yaw_rate": float(info.get("yaw_rate", 0.0)),
                             "yaw_start": float(info.get("yaw_start", 0.0)),
+                            "final_camera_visible": bool(
+                                info.get("camera_visible", False)
+                            ),
+                            "final_camera_good": bool(
+                                info.get("camera_good", False)
+                            ),
+                            "final_camera_normalized_u": float(
+                                info.get("camera_normalized_u", 0.0)
+                            ),
+                            "final_camera_normalized_v": float(
+                                info.get("camera_normalized_v", 0.0)
+                            ),
+                            "final_camera_bearing_rad": float(
+                                info.get("camera_bearing_rad", 0.0)
+                            ),
+                            "final_camera_elevation_rad": float(
+                                info.get("camera_elevation_rad", 0.0)
+                            ),
+                            "final_camera_center_quality": float(
+                                info.get("camera_center_quality", 0.0)
+                            ),
+                            "camera_success_met": bool(
+                                info.get("camera_success_met", False)
+                            ),
+                            "camera_eligible_steps": int(
+                                info.get("camera_eligible_steps", 0)
+                            ),
+                            "camera_visible_steps": int(
+                                info.get("camera_visible_steps", 0)
+                            ),
+                            "camera_good_steps": int(
+                                info.get("camera_good_steps", 0)
+                            ),
+                            "camera_visible_fraction": float(
+                                info.get("camera_visible_fraction", 0.0)
+                            ),
+                            "camera_good_fraction": float(
+                                info.get("camera_good_fraction", 0.0)
+                            ),
+                            "camera_max_consecutive_lost_sec": float(
+                                info.get(
+                                    "camera_max_consecutive_lost_sec", 0.0
+                                )
+                            ),
+                            "camera_local_visible_fraction": float(
+                                info.get("camera_local_visible_fraction", 0.0)
+                            ),
+                            "camera_local_good_fraction": float(
+                                info.get("camera_local_good_fraction", 0.0)
+                            ),
+                            "camera_local_center_quality": float(
+                                info.get("camera_local_center_quality", 0.0)
+                            ),
+                            "camera_local_joint_quality": float(
+                                info.get("camera_local_joint_quality", 0.0)
+                            ),
                             "final_cmd_roll_rate": float(info.get("cmd_roll_rate", 0.0)),
                             "final_cmd_pitch_rate": float(info.get("cmd_pitch_rate", 0.0)),
                             "final_cmd_yaw_rate": float(info.get("cmd_yaw_rate", 0.0)),
@@ -2126,6 +2437,31 @@ def main():
             success_count = int(stats_reasons.get("success", 0))
             timeout_count = int(stats_reasons.get("timeout", 0))
             other_done_count = int(sum(v for k, v in stats_reasons.items() if k not in ("running", "success", "timeout")))
+            completed_episode_count = (
+                success_count + timeout_count + other_done_count
+            )
+            outcome_denominator = float(max(1, completed_episode_count))
+            mean_completed_final_xy_err = (
+                float(np.mean(stats_completed_final_xy))
+                if stats_completed_final_xy
+                else 0.0
+            )
+            final_xy_quality = (
+                math.exp(
+                    -(
+                        mean_completed_final_xy_err
+                        / max(1e-6, args.tracking_xy_tolerance_m)
+                    )
+                    ** 2
+                )
+                if completed_episode_count > 0
+                else 0.0
+            )
+            final_stop_good_fraction = (
+                float(np.mean(stats_primitive_good["final_stop"]))
+                if stats_primitive_good["final_stop"]
+                else 0.0
+            )
             elapsed = max(1e-9, time.perf_counter() - start_wall)
             update_wall_sec = max(0.0, time.perf_counter() - update_start_wall)
             sps = total_steps / elapsed
@@ -2175,6 +2511,19 @@ def main():
                 "success_count": success_count,
                 "timeout_count": timeout_count,
                 "other_done_count": other_done_count,
+                "completed_episode_count": int(completed_episode_count),
+                "overall_success_rate": float(
+                    success_count / outcome_denominator
+                ),
+                "timeout_rate": float(timeout_count / outcome_denominator),
+                "other_failure_rate": float(
+                    other_done_count / outcome_denominator
+                ),
+                "mean_completed_final_xy_err": float(
+                    mean_completed_final_xy_err
+                ),
+                "final_xy_quality": float(final_xy_quality),
+                "final_stop_good_fraction": float(final_stop_good_fraction),
                 "done_reasons": json.dumps(dict(stats_reasons), sort_keys=True),
                 "primitive_sample_counts": json.dumps(
                     dict(stats_primitives),
@@ -2313,17 +2662,26 @@ def main():
                 "mean_abs_policy_cmd_pitch_rate": float(
                     np.mean(stats_abs_commands["policy_pitch"])
                 ),
+                "mean_abs_policy_cmd_yaw_rate": float(
+                    np.mean(stats_abs_commands["policy_yaw"])
+                ),
                 "mean_abs_controller_cmd_roll_rate": float(
                     np.mean(stats_abs_commands["controller_roll"])
                 ),
                 "mean_abs_controller_cmd_pitch_rate": float(
                     np.mean(stats_abs_commands["controller_pitch"])
                 ),
+                "mean_abs_controller_cmd_yaw_rate": float(
+                    np.mean(stats_abs_commands["controller_yaw"])
+                ),
                 "mean_abs_final_cmd_roll_rate": float(
                     np.mean(stats_abs_commands["final_roll"])
                 ),
                 "mean_abs_final_cmd_pitch_rate": float(
                     np.mean(stats_abs_commands["final_pitch"])
+                ),
+                "mean_abs_final_cmd_yaw_rate": float(
+                    np.mean(stats_abs_commands["final_yaw"])
                 ),
                 "mean_target_speed": float(np.mean(stats_target_speed)) if stats_target_speed else 0.0,
                 "mean_tracking_velocity_error": float(np.mean(stats_tracking_vel)) if stats_tracking_vel else 0.0,
@@ -2402,6 +2760,69 @@ def main():
                 "mean_local_tracking_xy_drift_delta_m": (
                     float(np.mean(stats_local_tracking_drift))
                     if stats_local_tracking_drift
+                    else 0.0
+                ),
+                "camera_visible_sample_fraction": (
+                    float(np.mean(stats_camera_visible_sample))
+                    if stats_camera_visible_sample
+                    else 0.0
+                ),
+                "camera_good_sample_fraction": (
+                    float(np.mean(stats_camera_good_sample))
+                    if stats_camera_good_sample
+                    else 0.0
+                ),
+                "mean_camera_center_quality": (
+                    float(np.mean(stats_camera_center_quality))
+                    if stats_camera_center_quality
+                    else 0.0
+                ),
+                "mean_abs_camera_bearing_rad": (
+                    float(np.mean(stats_camera_abs_bearing))
+                    if stats_camera_abs_bearing
+                    else 0.0
+                ),
+                "mean_abs_camera_elevation_rad": (
+                    float(np.mean(stats_camera_abs_elevation))
+                    if stats_camera_abs_elevation
+                    else 0.0
+                ),
+                "camera_success_met_fraction": (
+                    float(np.mean(stats_camera_success_met))
+                    if stats_camera_success_met
+                    else 0.0
+                ),
+                "mean_camera_visible_fraction": (
+                    float(np.mean(stats_camera_visible_fraction))
+                    if stats_camera_visible_fraction
+                    else 0.0
+                ),
+                "mean_camera_good_fraction": (
+                    float(np.mean(stats_camera_good_fraction))
+                    if stats_camera_good_fraction
+                    else 0.0
+                ),
+                "camera_local_ready_fraction": (
+                    float(np.mean(stats_camera_local_ready))
+                    if stats_camera_local_ready
+                    else 0.0
+                ),
+                "camera_local_event_count": int(
+                    len(stats_camera_local_events)
+                ),
+                "mean_camera_local_good_fraction": (
+                    float(np.mean(stats_camera_local_good_fraction))
+                    if stats_camera_local_good_fraction
+                    else 0.0
+                ),
+                "mean_camera_local_center_quality": (
+                    float(np.mean(stats_camera_local_center_quality))
+                    if stats_camera_local_center_quality
+                    else 0.0
+                ),
+                "mean_camera_max_consecutive_lost_sec": (
+                    float(np.mean(stats_camera_max_lost_sec))
+                    if stats_camera_max_lost_sec
                     else 0.0
                 ),
                 "vertical_success_met_fraction": (
@@ -2487,6 +2908,9 @@ def main():
                 **mean_reward_terms,
             }
             checkpoint_score = 0.0
+            checkpoint_components = {}
+            checkpoint_window_completed_episodes = 0
+            checkpoint_guardrail_violated = False
             best_checkpoint_saved = False
             early_stop_triggered = False
             if args.best_checkpoint_window > 0:
@@ -2496,36 +2920,59 @@ def main():
                     update_row,
                 ]
                 if len(score_rows) >= args.best_checkpoint_window:
-                    checkpoint_score = float(
-                        np.mean(
-                            [
-                                0.5 * row["moving_good_sample_fraction"]
-                                + 0.4 * row["moving_xy_good_sample_fraction"]
-                                + 0.1 * row["moving_success_met_fraction"]
-                                for row in score_rows
-                            ]
+                    checkpoint_score, checkpoint_components = (
+                        aggregate_checkpoint_score(
+                            score_rows,
+                            checkpoint_score_config,
                         )
                     )
-                    if checkpoint_score > best_checkpoint_score:
-                        best_checkpoint_score = checkpoint_score
-                        best_checkpoint_update = update
-                        degradation_updates = 0
-                        best_checkpoint_saved = True
-                    elif (
-                        checkpoint_score
-                        < best_checkpoint_score - args.early_stop_drop_threshold
-                    ):
-                        degradation_updates += 1
-                    else:
-                        degradation_updates = 0
-                    early_stop_triggered = bool(
-                        args.early_stop_patience_updates > 0
-                        and degradation_updates
-                        >= args.early_stop_patience_updates
+                    checkpoint_window_completed_episodes = int(
+                        checkpoint_components.get("completed_episodes", 0.0)
                     )
+                    if (
+                        checkpoint_window_completed_episodes
+                        >= args.best_checkpoint_min_episodes
+                    ):
+                        checkpoint_guardrail_violated = (
+                            violates_checkpoint_guardrails(
+                                checkpoint_components,
+                                best_checkpoint_components,
+                                checkpoint_score_config,
+                            )
+                        )
+                        if (
+                            checkpoint_score > best_checkpoint_score
+                            and not checkpoint_guardrail_violated
+                        ):
+                            best_checkpoint_score = checkpoint_score
+                            best_checkpoint_update = update
+                            best_checkpoint_components = dict(
+                                checkpoint_components
+                            )
+                            degradation_updates = 0
+                            best_checkpoint_saved = True
+                        elif checkpoint_guardrail_violated or (
+                            checkpoint_score
+                            < best_checkpoint_score
+                            - args.early_stop_drop_threshold
+                        ):
+                            degradation_updates += 1
+                        else:
+                            degradation_updates = 0
+                        early_stop_triggered = bool(
+                            args.early_stop_patience_updates > 0
+                            and degradation_updates
+                            >= args.early_stop_patience_updates
+                        )
             update_row.update(
                 {
                     "checkpoint_score": checkpoint_score,
+                    "checkpoint_window_completed_episodes": int(
+                        checkpoint_window_completed_episodes
+                    ),
+                    "checkpoint_guardrail_violated": bool(
+                        checkpoint_guardrail_violated
+                    ),
                     "best_checkpoint_score": (
                         best_checkpoint_score
                         if math.isfinite(best_checkpoint_score)
@@ -2557,11 +3004,14 @@ def main():
                         "update": int(update),
                         "total_steps": int(total_steps),
                         "window": int(args.best_checkpoint_window),
+                        "minimum_completed_episodes": int(
+                            args.best_checkpoint_min_episodes
+                        ),
                         "score": float(best_checkpoint_score),
-                        "metric": (
-                            "0.5*moving_good_sample_fraction + "
-                            "0.4*moving_xy_good_sample_fraction + "
-                            "0.1*moving_success_met_fraction"
+                        "metric": checkpoint_score_formula(),
+                        "components": best_checkpoint_components,
+                        "guardrail_drop": float(
+                            args.best_checkpoint_guardrail_drop
                         ),
                     },
                 )
@@ -2626,6 +3076,26 @@ def main():
                 f"position={update_row['stopped_position_zone_fraction']:.3f}, "
                 f"stationary={update_row['stopped_stationary_fraction']:.3f}"
             )
+            print(
+                "  episode_outcomes: "
+                f"completed={update_row['completed_episode_count']}, "
+                f"success={update_row['overall_success_rate']:.3f}, "
+                f"timeout={update_row['timeout_rate']:.3f}, "
+                f"other_failure={update_row['other_failure_rate']:.3f}, "
+                f"final_xy={update_row['mean_completed_final_xy_err']:.3f}m, "
+                f"final_stop={update_row['final_stop_good_fraction']:.3f}"
+            )
+            if args.best_checkpoint_window > 0:
+                print(
+                    "  checkpoint: "
+                    f"score={update_row['checkpoint_score']:.4f}, "
+                    f"window_episodes="
+                    f"{update_row['checkpoint_window_completed_episodes']}, "
+                    f"guardrail={update_row['checkpoint_guardrail_violated']}, "
+                    f"best={update_row['best_checkpoint_score']:.4f}"
+                    f"@update{update_row['best_checkpoint_update']}, "
+                    f"degradation_updates={update_row['degradation_updates']}"
+                )
             print(f"  done_reasons: {dict(stats_reasons)}")
             primitive_good_summary = {
                 key: round(float(np.mean(values)), 3)
@@ -2679,7 +3149,11 @@ def main():
                 f"pitch(policy/helper/final)="
                 f"{update_row['mean_abs_policy_cmd_pitch_rate']:.4f}/"
                 f"{update_row['mean_abs_controller_cmd_pitch_rate']:.4f}/"
-                f"{update_row['mean_abs_final_cmd_pitch_rate']:.4f}"
+                f"{update_row['mean_abs_final_cmd_pitch_rate']:.4f}, "
+                f"yaw(policy/helper/final)="
+                f"{update_row['mean_abs_policy_cmd_yaw_rate']:.4f}/"
+                f"{update_row['mean_abs_controller_cmd_yaw_rate']:.4f}/"
+                f"{update_row['mean_abs_final_cmd_yaw_rate']:.4f}"
             )
             print(
                 "  local_tracking: "
@@ -2691,6 +3165,29 @@ def main():
                 f"z={update_row['mean_local_tracking_z_good_fraction']:.3f}, "
                 f"drift={update_row['mean_local_tracking_xy_drift_delta_m']:.3f}m"
             )
+            if args.camera_tracking_enabled:
+                print(
+                    "  camera_tracking: "
+                    f"visible={update_row['camera_visible_sample_fraction']:.3f}, "
+                    f"success_fov={update_row['camera_good_sample_fraction']:.3f}, "
+                    f"episode_gate={update_row['camera_success_met_fraction']:.3f}, "
+                    f"center={update_row['mean_camera_center_quality']:.3f}, "
+                    f"abs_bearing="
+                    f"{math.degrees(update_row['mean_abs_camera_bearing_rad']):.1f}deg, "
+                    f"abs_elevation="
+                    f"{math.degrees(update_row['mean_abs_camera_elevation_rad']):.1f}deg"
+                )
+                print(
+                    "  camera_local_2s: "
+                    f"ready={update_row['camera_local_ready_fraction']:.3f}, "
+                    f"events={update_row['camera_local_event_count']}, "
+                    f"success_fov="
+                    f"{update_row['mean_camera_local_good_fraction']:.3f}, "
+                    f"center="
+                    f"{update_row['mean_camera_local_center_quality']:.3f}, "
+                    f"max_lost="
+                    f"{update_row['mean_camera_max_consecutive_lost_sec']:.2f}s"
+                )
             print(
                 "  reward_terms: "
                 f"time={update_row['mean_reward_time']:.4f}, "
@@ -2706,6 +3203,10 @@ def main():
                 f"moving_progress={update_row['mean_reward_moving_progress']:.4f}, "
                 f"local_tracking={update_row['mean_reward_local_tracking']:.4f}, "
                 f"local_drift={update_row['mean_reward_local_drift']:.4f}, "
+                f"camera_center={update_row['mean_reward_camera_center']:.4f}, "
+                f"camera_visible={update_row['mean_reward_camera_visible']:.4f}, "
+                f"camera_lost={update_row['mean_reward_camera_lost']:.4f}, "
+                f"camera_local={update_row['mean_reward_camera_local']:.4f}, "
                 f"stopped_position={update_row['mean_reward_stopped_position']:.4f}, "
                 f"goal_zone={update_row['mean_reward_goal_zone']:.4f}, "
                 f"dwell={update_row['mean_reward_dwell']:.4f}, "

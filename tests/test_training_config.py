@@ -82,6 +82,28 @@ class TrainingConfigTest(unittest.TestCase):
         self.assertEqual(args.motion_pool_config["max_segments"], 8)
         self.assertIn("cruise", args.motion_pool_config["primitive_library"])
 
+    def test_stage8_enables_camera_gru_and_short_high_amplitude_pool(self) -> None:
+        args = self._parse(
+            "stage8_camera_short_high_amplitude_5hz_ratio_5to5_100k_seed8.json"
+        )
+        self.assertEqual(args.seed, 8)
+        self.assertEqual(args.rollout_steps, 256)
+        self.assertEqual(args.episode_length, 320)
+        self.assertEqual(args.actor_recurrent_mode, "train")
+        self.assertTrue(args.camera_tracking_enabled)
+        self.assertAlmostEqual(args.tracking_xy_tolerance_m, 0.3)
+        self.assertAlmostEqual(args.moving_success_xy_tolerance_m, 0.3)
+        self.assertAlmostEqual(args.tracking_z_tolerance_m, 0.3)
+        self.assertAlmostEqual(args.vertical_motion_z_tolerance_m, 0.3)
+        self.assertEqual(args.motion_pool_config["min_segments"], 2)
+        self.assertEqual(args.motion_pool_config["max_segments"], 4)
+        self.assertIn("turn", args.motion_pool_config["required_ids"])
+        turn = args.motion_pool_config["primitive_library"]["turn"]
+        climb = args.motion_pool_config["primitive_library"]["climb"]
+        self.assertAlmostEqual(turn["min_heading_change_deg"], 35.0)
+        self.assertAlmostEqual(climb["min_vertical_displacement_m"], 0.6)
+        self.assertEqual(args.best_checkpoint_min_episodes, 24)
+
     def test_fixed_evaluation_is_deterministic_and_does_not_train(self) -> None:
         args = self._parse("eval_fixed_seed5_best_50k.json")
         self.assertTrue(args.evaluation_only)

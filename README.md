@@ -17,8 +17,8 @@ helper is temporary and is reduced through the training curriculum.
 
 ## Actor and critic
 
-The deployed Actor has 32 causal inputs. They are measurable vehicle state and
-current task references only:
+The baseline deployed Actor has 32 causal inputs. They are measurable vehicle
+state and current task references only:
 
 - local NED position, velocity and acceleration
 - roll, pitch, sine/cosine yaw and FRD body rates
@@ -32,6 +32,13 @@ No future trajectory point, primitive ID, phase ID or trajectory progress is an
 Actor input. In particular, a path sampled by the simulator cannot leak into
 the policy that will be deployed against an unknown real target.
 
+When forward-camera tracking is enabled, six causal image-space features are
+appended: normalized horizontal/vertical image coordinates, normalized forward
+depth/range, visibility and center quality. The Actor is therefore 38-dimensional
+for the camera curriculum. These values describe the actual moving target, not
+the following point one metre behind it. They can later be supplied by a visual
+target detector/tracker instead of simulator geometry.
+
 `actor_mask_target_acceleration=true` keeps the 32-value checkpoint contract
 but fills the three following-point acceleration slots with zero. This is the
 default in the masked bridge and vertical curriculum configs. Vehicle
@@ -42,24 +49,24 @@ the temporary helper controller.
 The Actor is:
 
 ```text
-32 causal values -> 256-256-128 ELU frame encoder
+32 or 38 causal values -> 256-256-128 ELU frame encoder
 frame embedding history -> GRU 128
 small gated recurrent residual -> tanh-squashed Gaussian CTBR action
 ```
 
-The frame encoder, GRU and action head keep their parameter names. A previous
-47-input checkpoint from this project can therefore transfer all shared Actor
-tensors; its removed future-reference encoder and gate are explicitly skipped.
-For the bridge run, the recurrent residual starts at a small nonzero gate, is
-held fixed for 15 updates, then becomes trainable. The inherited frame policy
-uses a lower learning rate while the GRU branch uses a higher learning rate.
+The frame encoder, GRU and action head keep their parameter names. The partial
+checkpoint loader copies all shared tensors and explicitly zero-initializes
+new input columns. A 32-input policy therefore produces exactly its old action
+before the new camera columns learn nonzero weights. Stage 8 restores training
+of the transferred GRU residual branch at a reduced recurrent learning rate.
 
-The asymmetric Critic remains 77-dimensional: 32 Actor values, 15 future
-following-point values at 0.2, 0.4, 0.8, 1.2 and 1.6 seconds, and 30 privileged
-values. The last group contains simulator-only phase, primitive ID, segment
-progress, remaining episode time, true target/reference velocity and
-acceleration, and control mix ratio. The generated future trajectory is thus a
-training-only value baseline aid; neither privileged group reaches the Actor.
+The asymmetric Critic is 83-dimensional without the camera: 32 Actor values,
+15 future following-point values at 0.2, 0.4, 0.8, 1.2 and 1.6 seconds, and 36
+privileged values. The camera curriculum appends six Actor camera values and
+six camera-quality privileged values, producing a 95-dimensional Critic. The
+legacy 83 columns retain their exact order during migration. Simulator-only
+phase, primitive ID, segment progress, remaining episode time, exact target
+dynamics and future trajectory never reach the Actor.
 
 Recurrent PPO minibatches preserve complete time sequences and split by
 environment rather than randomly mixing individual transitions. Actor and
@@ -121,6 +128,11 @@ limits on:
 Transitions are smooth. Velocity and heading are never changed instantaneously.
 Trajectory samples that leave the configured workspace are rejected and
 resampled.
+
+Individual templates may additionally require a minimum integrated heading
+change, vertical displacement or speed change. These constraints are evaluated
+on the generated trajectory rather than only on the sampled command, preventing
+a nominally selected turn or climb from having negligible physical amplitude.
 
 The horizontal following point is defined from the trajectory tangent:
 
@@ -185,6 +197,38 @@ minimum XY/velocity/Z good fraction and emits once per configured interval. A
 separate penalty is applied only when XY error has increased beyond a deadband
 across the window. The history is not reset at primitive boundaries, so it also
 applies to continuous random trajectories.
+
+### Forward camera objective
+
+The camera curriculum uses a fixed pinhole camera with `x` forward, `y` right
+and `z` down. The simulator target is transformed in this order:
+
+```text
+relative NED position -> inverse vehicle NED/FRD attitude -> inverse camera mount
+u = camera_y / (camera_x * tan(horizontal_fov / 2))
+v = camera_z / (camera_x * tan(vertical_fov / 2))
+```
+
+The target is visible only when it is in front of the camera, inside the near
+and far clipping range, and `abs(u), abs(v) <= 1`. A configurable inner margin
+defines the success FOV. Center quality is a continuous two-dimensional Gaussian
+in `(u, v)`, so centering receives more reward than merely touching the image
+edge. Out-of-view samples receive a penalty.
+
+Camera success is percentage based, like moving tracking success: at least
+`camera_success_min_fraction` of all task samples must lie inside the success
+FOV. Final stopped dwell additionally requires the target to be inside the FOV
+at the current step. The same camera condition is joined with the causal 2-second
+tracking window; a local tracking completion reward is withheld when the recent
+camera fraction is below `camera_local_success_min_fraction`.
+
+When camera tracking is active, the task-level yaw-hold helper is disabled and
+PPO must command CTBR yaw to keep the target visible. The permanent body-rate
+loop remains active. This geometry models rigid mounting, full 3D vehicle
+attitude, FOV and clipping, but it does not yet model occlusion, lens distortion,
+detector latency/dropout or image-estimation noise. Those effects should be
+domain-randomized before replacing the geometric observation with a real vision
+pipeline.
 
 ## JSON training configs
 
@@ -252,13 +296,21 @@ Available curriculum configs:
   `lambda=0.98`, adds the 2-second local signal, trains the Critic in PopArt
   normalized units, freezes the transferred GRU branch, and limits cumulative
   Actor drift with a fixed-reference KL term.
+- `stage8_camera_short_high_amplitude_5hz_ratio_5to5_100k_seed8.json`: transfers
+  the Stage 7 best checkpoint, restores GRU training, unifies moving/stopped XY
+  and Z tolerances at 0.3 m, and adds the forward-camera objective. Each episode
+  has an initial acceleration plus two to four sampled segments (three to five
+  total), with at least one turn of 35 degrees or more and one straight climb or
+  descent of 0.6 m or more.
 - `eval_fixed_seed5_best_50k.json`: deterministic no-update evaluation with a
   fixed per-environment task bank. `ablation/run_fixed_ablation.sh` compares the
   retained GRU, disabled GRU, wider CTBR roll/pitch limits and helper-only control.
 
 Stage 7 sets `allow_partial_checkpoint=true` because six causal local-window
-statistics were added to the privileged Critic input. Actor tensors remain exact;
-only the added columns of the Critic input layer start from fresh initialization.
+statistics were added to the privileged Critic input. Stage 8 also uses partial
+loading because its camera observations expand Actor and Critic inputs; every
+new input column starts at zero so the transferred policy remains initially
+unchanged.
 
 New checkpoints include Actor and Critic optimizer states, PopArt state when
 enabled, the fixed reference-policy anchor when used, plus Python, NumPy, Torch
@@ -272,9 +324,13 @@ handled by the training process.
 
 When `best_checkpoint_window` is enabled, the trainer also saves
 `models/actor_critic_best.pt` and a JSON sidecar. Its rolling score combines
-moving joint quality (50%), moving XY quality (40%) and the moving success gate
-(10%). Optional early stopping counts consecutive updates whose rolling score
-falls by more than `early_stop_drop_threshold` from the best score.
+moving joint/XY quality, overall episode success, stopped XY/3D/stationary
+quality, final-stop quality, completed-episode final XY error and camera
+visibility. Timeout and other failure rates are penalties. A candidate is not
+eligible until the rolling window contains `best_checkpoint_min_episodes`, and
+critical overall-success, stopped-XY, final-stop, final-XY and camera metrics
+cannot drop beyond `best_checkpoint_guardrail_drop`. Optional early stopping
+uses this same guarded score rather than moving quality alone.
 
 ## Results
 
@@ -286,7 +342,8 @@ and the timestamp distinguishes repeated runs. Each run stores:
 - current, interval and interrupted checkpoints
 - terminal log and optional TensorBoard events
 - update and episode CSV files
-- tracking, reward, PPO, outcome, direction/radius and primitive plots
+- tracking, reward, PPO, outcome, checkpoint, camera, direction/radius and
+  primitive plots
 
 Update metrics include the raw/effective GRU gate, separate backbone/recurrent
 learning rates, raw return/value statistics, value clipping, reference KL,
@@ -298,7 +355,11 @@ Those conditions are also split by primitive in
 `plots/primitive_conditions.png`; `condition_diagnostics.png` and
 `episode_condition_fractions.png` expose the main success bottleneck directly.
 Episode rows include the sampled primitive sequence, trajectory duration,
-curvature and actual 3D target/follow endpoint.
+curvature, actual 3D target/follow endpoint, final image coordinates, camera
+visibility fraction and maximum lost-target streak. `checkpoint_and_outcomes.png`
+shows overall success, timeout, stopped conditions and final XY error;
+`camera_tracking.png` and the camera panel in
+`episode_condition_fractions.png` expose view-centering failures directly.
 
 ## Host-side tests
 

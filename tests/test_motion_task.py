@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 import unittest
 from pathlib import Path
 
 import numpy as np
 
 from pegasus_iris_fast_line_follow.motion_task import MotionPoolConfig, MotionTaskGenerator
+from pegasus_iris_fast_line_follow.training_config import load_training_config
 
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
@@ -163,6 +165,41 @@ class MotionTaskGeneratorTest(unittest.TestCase):
                 * config_data["environment"]["step_dt_sim_sec"],
             )
         self.assertEqual(sampled_lengths, {11, 12, 13})
+
+    def test_camera_stage_enforces_large_turn_and_vertical_amplitudes(self) -> None:
+        _, special, _ = load_training_config(
+            PACKAGE_DIR
+            / "configs"
+            / "stage8_camera_short_high_amplitude_5hz_ratio_5to5_100k_seed8.json"
+        )
+        config = MotionPoolConfig.from_dict(special["motion_pool"])
+        generator = MotionTaskGenerator(config, dt=0.2, follow_distance_m=1.0)
+        rng = np.random.default_rng(8)
+        for _ in range(48):
+            trajectory = generator.sample(
+                rng,
+                [0.0, 0.0, -5.0],
+                rng.uniform(-math.pi / 3.0, math.pi / 3.0),
+            )
+            self.assertIn(len(trajectory.sequence_ids), {3, 4, 5})
+            for segment_index, primitive_id in enumerate(
+                trajectory.sequence_ids
+            ):
+                indices = np.flatnonzero(
+                    trajectory.segment_indices == segment_index
+                )
+                start = max(0, int(indices[0]) - 1)
+                end = int(indices[-1])
+                if primitive_id == "turn":
+                    heading = np.unwrap(trajectory.headings[start : end + 1])
+                    change_deg = abs(np.degrees(heading[-1] - heading[0]))
+                    self.assertGreaterEqual(change_deg + 1e-6, 35.0)
+                if primitive_id in {"climb", "descend"}:
+                    displacement = abs(
+                        trajectory.positions[end, 2]
+                        - trajectory.positions[start, 2]
+                    )
+                    self.assertGreaterEqual(displacement + 1e-6, 0.6)
 
 
 if __name__ == "__main__":

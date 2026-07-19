@@ -23,7 +23,7 @@ class RecurrentActorCriticTest(unittest.TestCase):
         self.policy = ActorCritic(
             obs_dim=32,
             action_dim=4,
-            critic_obs_dim=77,
+            critic_obs_dim=83,
             actor_hidden_sizes=(64, 32),
             critic_hidden_sizes=(64, 32),
             recurrent_hidden_size=32,
@@ -42,7 +42,7 @@ class RecurrentActorCriticTest(unittest.TestCase):
         time_steps = 5
         batch_size = 4
         obs = torch.randn(time_steps, batch_size, 32)
-        critic_obs = torch.randn(time_steps, batch_size, 77)
+        critic_obs = torch.randn(time_steps, batch_size, 83)
         actions = torch.tanh(torch.randn(time_steps, batch_size, 4))
         episode_starts = torch.zeros(time_steps, batch_size)
         episode_starts[0] = 1.0
@@ -101,7 +101,7 @@ class RecurrentActorCriticTest(unittest.TestCase):
             restored = ActorCritic(
                 obs_dim=32,
                 action_dim=4,
-                critic_obs_dim=77,
+                critic_obs_dim=83,
                 actor_hidden_sizes=(64, 32),
                 critic_hidden_sizes=(64, 32),
                 recurrent_hidden_size=32,
@@ -164,7 +164,7 @@ class RecurrentActorCriticTest(unittest.TestCase):
             restored = ActorCritic(
                 obs_dim=32,
                 action_dim=4,
-                critic_obs_dim=77,
+                critic_obs_dim=83,
                 actor_hidden_sizes=(64, 32),
                 critic_hidden_sizes=(64, 32),
                 recurrent_hidden_size=32,
@@ -177,6 +177,49 @@ class RecurrentActorCriticTest(unittest.TestCase):
             )
             self.assertTrue(
                 torch.allclose(self.policy.actor_mean.weight, restored.actor_mean.weight)
+            )
+
+    def test_partial_load_zeros_appended_observation_columns(self) -> None:
+        with TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "old_observation_checkpoint.pt"
+            torch.save({"state_dict": self.policy.state_dict()}, checkpoint)
+            restored = ActorCritic(
+                obs_dim=38,
+                action_dim=4,
+                critic_obs_dim=95,
+                actor_hidden_sizes=(64, 32),
+                critic_hidden_sizes=(64, 32),
+                recurrent_hidden_size=32,
+                temporal_gate_init=0.0,
+            )
+            load_transplanted_checkpoint(
+                restored,
+                checkpoint,
+                torch.device("cpu"),
+                allow_partial=True,
+            )
+            self.assertTrue(
+                torch.allclose(restored.actor_body[0].weight[:, 32:], torch.zeros(64, 6))
+            )
+            self.assertTrue(
+                torch.allclose(restored.critic_body[0].weight[:, 83:], torch.zeros(64, 12))
+            )
+            old_obs = torch.randn(3, 32)
+            new_obs = torch.cat((old_obs, torch.randn(3, 6)), dim=1)
+            hidden = self.policy.initial_state(3)
+            old_action, _ = self.policy.deterministic_action(old_obs, hidden)
+            new_action, _ = restored.deterministic_action(new_obs, hidden)
+            self.assertTrue(torch.allclose(old_action, new_action, atol=1e-7))
+            old_critic_obs = torch.randn(3, 83)
+            new_critic_obs = torch.cat(
+                (old_critic_obs, torch.randn(3, 12)), dim=1
+            )
+            self.assertTrue(
+                torch.allclose(
+                    self.policy.value(old_critic_obs),
+                    restored.value(new_critic_obs),
+                    atol=1e-7,
+                )
             )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
@@ -203,7 +246,7 @@ class RecurrentActorCriticTest(unittest.TestCase):
             restored = ActorCritic(
                 obs_dim=32,
                 action_dim=4,
-                critic_obs_dim=77,
+                critic_obs_dim=83,
                 actor_hidden_sizes=(64, 32),
                 critic_hidden_sizes=(64, 32),
                 recurrent_hidden_size=32,

@@ -491,6 +491,10 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
 
     plot_dir = run_dir / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        run_args = json.loads((run_dir / "args.json").read_text(encoding="utf-8"))
+    except Exception:
+        run_args = {}
     if update_rows:
         x = [r["total_steps"] for r in update_rows]
         fig, axes = plt.subplots(4, 1, figsize=(11, 13), sharex=True)
@@ -696,6 +700,134 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         fig.savefig(plot_dir / "local_credit_and_control.png", dpi=150)
         plt.close(fig)
 
+        fig, axes = plt.subplots(4, 1, figsize=(11, 13), sharex=True)
+        axes[0].plot(
+            x,
+            [r.get("checkpoint_score", 0.0) for r in update_rows],
+            label="rolling score",
+        )
+        axes[0].plot(
+            x,
+            [r.get("best_checkpoint_score", 0.0) for r in update_rows],
+            label="best score",
+        )
+        axes[0].set_ylabel("checkpoint score")
+        axes[0].legend()
+        axes[1].plot(
+            x,
+            [r.get("overall_success_rate", 0.0) for r in update_rows],
+            label="overall success",
+        )
+        axes[1].plot(
+            x,
+            [r.get("timeout_rate", 0.0) for r in update_rows],
+            label="timeout",
+        )
+        axes[1].plot(
+            x,
+            [r.get("other_failure_rate", 0.0) for r in update_rows],
+            label="other failure",
+        )
+        axes[1].set_ylim(0.0, 1.05)
+        axes[1].set_ylabel("episode outcome")
+        axes[1].legend()
+        for key, label in (
+            ("stopped_xy_zone_fraction", "stopped XY"),
+            ("stopped_position_zone_fraction", "stopped position"),
+            ("stopped_stationary_fraction", "stopped stationary"),
+            ("final_stop_good_fraction", "final-stop joint"),
+        ):
+            axes[2].plot(x, [r.get(key, 0.0) for r in update_rows], label=label)
+        axes[2].set_ylim(0.0, 1.05)
+        axes[2].set_ylabel("final-stop quality")
+        axes[2].legend()
+        axes[3].plot(
+            x,
+            [r.get("mean_completed_final_xy_err", 0.0) for r in update_rows],
+            label="completed final XY error",
+        )
+        axes[3].axhline(
+            float(run_args.get("tracking_xy_tolerance_m", 0.3)),
+            color="tab:red",
+            linestyle="--",
+            label="final XY tolerance",
+        )
+        axes[3].set_ylabel("final XY error (m)")
+        axes[3].set_xlabel("env steps")
+        axes[3].legend()
+        fig.tight_layout()
+        fig.savefig(plot_dir / "checkpoint_and_outcomes.png", dpi=150)
+        plt.close(fig)
+
+        if bool(run_args.get("camera_tracking_enabled", False)):
+            fig, axes = plt.subplots(4, 1, figsize=(11, 13), sharex=True)
+            for key, label in (
+                ("camera_visible_sample_fraction", "visible"),
+                ("camera_good_sample_fraction", "success FOV"),
+                ("camera_success_met_fraction", "episode gate met"),
+            ):
+                axes[0].plot(
+                    x, [r.get(key, 0.0) for r in update_rows], label=label
+                )
+            axes[0].axhline(
+                float(run_args.get("camera_success_min_fraction", 0.9)),
+                color="tab:red",
+                linestyle="--",
+                label="success threshold",
+            )
+            axes[0].set_ylim(0.0, 1.05)
+            axes[0].set_ylabel("camera fraction")
+            axes[0].legend()
+            axes[1].plot(
+                x,
+                [r.get("mean_camera_center_quality", 0.0) for r in update_rows],
+                label="center quality",
+            )
+            axes[1].plot(
+                x,
+                [r.get("mean_abs_camera_bearing_rad", 0.0) for r in update_rows],
+                label="abs bearing (rad)",
+            )
+            axes[1].plot(
+                x,
+                [r.get("mean_abs_camera_elevation_rad", 0.0) for r in update_rows],
+                label="abs elevation (rad)",
+            )
+            axes[1].set_ylabel("image geometry")
+            axes[1].legend()
+            axes[2].plot(
+                x,
+                [r.get("mean_camera_local_good_fraction", 0.0) for r in update_rows],
+                label="local success FOV",
+            )
+            axes[2].plot(
+                x,
+                [r.get("mean_camera_local_center_quality", 0.0) for r in update_rows],
+                label="local center quality",
+            )
+            axes[2].plot(
+                x,
+                [r.get("mean_camera_max_consecutive_lost_sec", 0.0) for r in update_rows],
+                label="max lost streak (s)",
+            )
+            axes[2].set_ylabel("local camera")
+            axes[2].legend()
+            for key, label in (
+                ("mean_reward_camera_center", "center"),
+                ("mean_reward_camera_visible", "visible"),
+                ("mean_reward_camera_lost", "lost"),
+                ("mean_reward_camera_local", "joint 2s"),
+            ):
+                axes[3].plot(
+                    x, [r.get(key, 0.0) for r in update_rows], label=label
+                )
+            axes[3].set_ylabel("camera reward")
+            axes[3].set_xlabel("env steps")
+            axes[3].legend()
+            fig.tight_layout()
+            fig.savefig(plot_dir / "camera_tracking.png", dpi=150)
+            plt.close(fig)
+
         fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
         axes[0].plot(x, [r["mean_reward_progress"] for r in update_rows], label="progress")
         axes[0].plot(x, [r["mean_reward_distance"] for r in update_rows], label="distance")
@@ -874,12 +1006,8 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         fig.savefig(plot_dir / "episode_metrics.png", dpi=150)
         plt.close(fig)
 
-        try:
-            run_args = json.loads((run_dir / "args.json").read_text(encoding="utf-8"))
-        except Exception:
-            run_args = {}
-        xy_tolerance = float(run_args.get("tracking_xy_tolerance_m", 0.5))
-        z_tolerance = float(run_args.get("tracking_z_tolerance_m", 0.35))
+        xy_tolerance = float(run_args.get("tracking_xy_tolerance_m", 0.3))
+        z_tolerance = float(run_args.get("tracking_z_tolerance_m", 0.3))
         speed_tolerance = float(run_args.get("stopped_speed_xy_tolerance_mps", 0.25))
         moving_good_tolerance = float(run_args.get("moving_success_min_fraction", 0.5))
         vertical_good_tolerance = float(
@@ -948,7 +1076,14 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         fig.savefig(plot_dir / "episode_outcomes.png", dpi=150)
         plt.close(fig)
 
-        fig, axes = plt.subplots(3, 1, figsize=(12, 11), sharex=True)
+        camera_enabled = bool(run_args.get("camera_tracking_enabled", False))
+        condition_count = 4 if camera_enabled else 3
+        fig, axes = plt.subplots(
+            condition_count,
+            1,
+            figsize=(12, 14 if camera_enabled else 11),
+            sharex=True,
+        )
         for key, label in (
             ("moving_xy_good_fraction", "XY"),
             ("moving_z_good_fraction", "Z"),
@@ -1000,8 +1135,32 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
             )
         axes[2].set_ylim(0.0, 1.05)
         axes[2].set_ylabel("stopped fraction")
-        axes[2].set_xlabel("completed episode")
         axes[2].legend()
+        if camera_enabled:
+            axes[3].plot(
+                episode_index,
+                [r.get("camera_visible_fraction", 0.0) for r in episode_rows],
+                ".",
+                markersize=3,
+                label="visible",
+            )
+            axes[3].plot(
+                episode_index,
+                [r.get("camera_good_fraction", 0.0) for r in episode_rows],
+                ".",
+                markersize=3,
+                label="success FOV",
+            )
+            axes[3].axhline(
+                float(run_args.get("camera_success_min_fraction", 0.9)),
+                color="tab:red",
+                linestyle="--",
+                label="camera success threshold",
+            )
+            axes[3].set_ylim(0.0, 1.05)
+            axes[3].set_ylabel("camera fraction")
+            axes[3].legend()
+        axes[-1].set_xlabel("completed episode")
         fig.tight_layout()
         fig.savefig(plot_dir / "episode_condition_fractions.png", dpi=150)
         plt.close(fig)
@@ -1225,6 +1384,26 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         )
         axes[1].plot(x, [r.get("return_capture", 0.0) for r in episode_rows], label="capture")
         axes[1].plot(x, [r.get("return_time", 0.0) for r in episode_rows], label="stop time")
+        axes[1].plot(
+            x,
+            [r.get("return_camera_center", 0.0) for r in episode_rows],
+            label="camera center",
+        )
+        axes[1].plot(
+            x,
+            [r.get("return_camera_visible", 0.0) for r in episode_rows],
+            label="camera visible",
+        )
+        axes[1].plot(
+            x,
+            [r.get("return_camera_lost", 0.0) for r in episode_rows],
+            label="camera lost",
+        )
+        axes[1].plot(
+            x,
+            [r.get("return_camera_local", 0.0) for r in episode_rows],
+            label="camera local",
+        )
         axes[1].plot(x, [r["return_goal_zone"] for r in episode_rows], label="goal zone")
         axes[1].plot(x, [r["return_dwell"] for r in episode_rows], label="dwell")
         axes[1].plot(x, [r["return_success"] for r in episode_rows], label="success")
@@ -1278,6 +1457,15 @@ def load_transplanted_checkpoint(
         if allow_partial and src_tensor.ndim == dst_value.ndim and src_tensor.ndim > 0:
             slices = tuple(slice(0, min(src_tensor.shape[i], dst_value.shape[i])) for i in range(src_tensor.ndim))
             copied = dst_value.clone()
+            # Appended observation columns must start inert. This preserves the
+            # exact transferred policy/value function until gradients learn how
+            # to use the new sensors.
+            if (
+                src_tensor.ndim >= 2
+                and src_tensor.shape[:-1] == dst_value.shape[:-1]
+                and src_tensor.shape[-1] < dst_value.shape[-1]
+            ):
+                copied[..., src_tensor.shape[-1] :] = 0.0
             copied[slices] = src_tensor[slices]
             merged[key] = copied
             partial.append(f"{key}: {tuple(src_tensor.shape)} -> {tuple(dst_value.shape)}")
