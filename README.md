@@ -24,12 +24,20 @@ current task references only:
 - roll, pitch, sine/cosine yaw and FRD body rates
 - current following-point relative position
 - target relative position
-- desired following-point velocity and acceleration
+- desired following-point velocity
+- three reserved following-point acceleration slots
 - previous applied CTBR command
 
 No future trajectory point, primitive ID, phase ID or trajectory progress is an
 Actor input. In particular, a path sampled by the simulator cannot leak into
 the policy that will be deployed against an unknown real target.
+
+`actor_mask_target_acceleration=true` keeps the 32-value checkpoint contract
+but fills the three following-point acceleration slots with zero. This is the
+default in the masked bridge and vertical curriculum configs. Vehicle
+acceleration remains available to the Actor; exact target/reference
+acceleration remains available only to the training-time privileged Critic and
+the temporary helper controller.
 
 The Actor is:
 
@@ -76,6 +84,28 @@ hold, accelerate, cruise, decelerate, turn, climb, descend
 `final_stop`, `stopped` and `capture` are internal IDs. A config selects the
 training pool through `primitive_ids`. `prefix_ids` fixes an initial sequence,
 and `required_ids` guarantees that selected primitives occur at least once.
+`required_one_of_ids` reserves one sampled slot for one member of a group; the
+vertical curriculum uses `["climb", "descend"]` so every episode contains at
+least one altitude-change segment without forcing both directions. Keep those
+IDs out of `primitive_ids` when the curriculum must contain exactly one vertical
+segment per episode.
+
+The helper's vertical CTBR correction is:
+
+```text
+delta_thrust = z_feedback_scale * (
+    z_pos_gain * z_error
+  + z_vel_gain * own_vertical_velocity
+  - z_target_velocity_gain * target_vertical_velocity
+  - z_target_accel_gain * target_vertical_acceleration
+)
+```
+
+`z_target_velocity_gain` defaults to zero for backward compatibility. Setting it
+near `z_vel_gain` adds target vertical-velocity feedforward while retaining
+position feedback and velocity damping. `z_target_accel_gain` also defaults to
+zero and is helper-only; enabling it compensates the smooth acceleration at the
+start and end of a vertical trajectory segment.
 
 Every sampled segment has a random duration, target horizontal speed,
 acceleration limit, curvature and vertical speed. The generator enforces global
@@ -122,11 +152,32 @@ terms are multiplied by the policy timestep, making reward scale stable when
 the action frequency changes. Capture entry and terminal rewards are one-time
 events and are not timestep-scaled.
 
+The optional moving progress term is signed and bounded:
+
+```text
+r_moving_progress = progress_weight
+                  * clip(previous_xy_error - current_xy_error, -limit, limit)
+```
+
+It rewards closing the follow-point error and gives an equal penalty when the
+vehicle drifts away. Unlike absolute position quality, it cannot be collected
+indefinitely by remaining at a mediocre tracking error. In ratio control mode,
+configs that use this term can disable the raw PPO action-magnitude penalty
+while retaining the action-difference penalty; otherwise a partly mixed PPO
+action is penalized at full scale even though only its configured ratio reaches
+the vehicle.
+
 `moving_good` remains a small bonus and a success diagnostic. It is not the
 main learning signal. Height and vertical velocity are part of the continuous
 3D tracking objective. If final stopping begins after the moving fraction has
 already failed, the episode ends with `moving_success_failed`; it cannot collect
 positive stopped rewards until timeout.
+
+For episodes containing `climb` or `descend`, success also requires a dedicated
+vertical fraction. A vertical step is good only when both follow-point height
+error and vertical-velocity error meet their tighter tolerances. Failure is
+reported as `vertical_success_failed`, and stopped reward is disabled when this
+gate has failed.
 
 ## JSON training configs
 
@@ -140,6 +191,8 @@ The normal training command now only needs `--config`:
 Config sections are organizational; scalar keys map to the existing command-line
 argument names. A command-line scalar still overrides the config value. Relative
 `results_root` and `load_checkpoint` paths are resolved from the config file.
+An optional `output.task_description` string is copied to `args.json` and printed
+at startup. If the config omits it, the field is omitted from `args.json`.
 
 Available curriculum configs:
 
@@ -151,6 +204,40 @@ Available curriculum configs:
 - `stage2_turn_pool_5hz_ratio_5to5.json`: adds turn segments and requires at
   least one real turn per episode. Replace `REPLACE_WITH_STAGE1_RUN` with the
   selected Stage 1 result directory before running it.
+- `stage2b_turn_pool_masked_accel_bridge_5hz_ratio_5to5.json`: keeps the Stage 2
+  task for a 100k-step distribution bridge while masking Actor target
+  acceleration. It points to the completed `seed43_20260715_155524` checkpoint.
+- `stage3_vertical_pool_5hz_ratio_5to5.json`: requires at least one straight
+  moving `climb` or `descend` segment per episode, retains the straight speed
+  primitives, and adds vertical-specific success diagnostics.
+  Replace `REPLACE_WITH_MASKED_ACCEL_BRIDGE_RUN` after completing Stage 2b.
+- `stage4_combined_long_pool_5hz_ratio_5to5.json`: transfers from the completed
+  Stage 3 policy and combines acceleration, cruise, deceleration, turns, straight
+  climbs and straight descents. Each episode starts with acceleration, samples
+  six to eight additional segments, and contains at least one turn and one
+  vertical segment. The policy horizon remains 5 Hz while the episode limit is
+  extended to 60 seconds.
+- `stage4_combined_long_pool_reward_rebalance_50k.json`: a short bridge from
+  Stage 4 update 30 that keeps the same task and success gates, shifts dense
+  reward weight from standalone velocity tracking toward continuous position
+  and joint tracking, resets optimizer momentum, and lowers the GRU learning
+  rate multiplier.
+- `stage5_combined_extra_long_pool_400k_seed2.json`: transfers the rebalanced
+  Stage 4 update-10 policy to seed 2, samples ten to twelve pool segments after
+  the initial acceleration, and extends the episode limit to 80 seconds without
+  increasing primitive speed, acceleration, curvature or vertical-speed limits.
+- `stage5a_corrective_reward_intermediate_pool_100k_seed3.json`: rolls back to
+  the pre-regression Stage 4 update-10 policy, uses eight to ten sampled segments
+  and a 128-step rollout, and aligns velocity reward with position recovery by
+  adding a bounded corrective velocity reference. A broad recovery term keeps
+  position reward informative when tracking error is outside the narrow Gaussian
+  region. Success still uses the original position and goal-velocity gates.
+- `stage5b_progress_reward_bridge_50k_seed5.json`: rolls back to the best early
+  seed-4 interval checkpoint and keeps the same eight-to-ten segment pool and
+  5:5 control mix. It adds signed moving XY progress, reduces the broad recovery
+  reward, removes the raw action-magnitude penalty, keeps a small action-change
+  penalty, resets optimizer momentum, and uses separate constant Actor/Critic
+  learning rates.
 
 The bridge config sets `allow_partial_checkpoint=true` because the old
 checkpoint contains the removed Actor future-reference branch. The 77-value
@@ -159,12 +246,23 @@ report exact shared tensors and only skip the obsolete reference tensors.
 
 New checkpoints include Actor and Critic optimizer states plus Python, NumPy,
 Torch and environment RNG states. A legacy checkpoint has no optimizer state,
-so the first migrated run intentionally starts new optimizers. Interrupting
-training saves both `actor_critic.pt` and `actor_critic_interrupted.pt`.
+so the first migrated run intentionally starts new optimizers. Set
+`reset_rng_on_load=true` when a transferred checkpoint should retain optimizer
+state but use the new config's seed and task sampling. Interrupting training
+saves both `actor_critic.pt` and `actor_critic_interrupted.pt` when shutdown is
+handled by the training process.
+
+When `best_checkpoint_window` is enabled, the trainer also saves
+`models/actor_critic_best.pt` and a JSON sidecar. Its rolling score combines
+moving joint quality (50%), moving XY quality (40%) and the moving success gate
+(10%). Optional early stopping counts consecutive updates whose rolling score
+falls by more than `early_stop_drop_threshold` from the best score.
 
 ## Results
 
-Each run keeps the timestamp naming style `seed43_YYYYMMDD_HHMMSS` and stores:
+New runs are written directly below `result/ppo_train` using the naming style
+`seed1_YYYYMMDD_HHMMSS`; the seed remains an actual reproducibility parameter
+and the timestamp distinguishes repeated runs. Each run stores:
 
 - resolved arguments/config and run summary
 - current, interval and interrupted checkpoints
@@ -174,6 +272,8 @@ Each run keeps the timestamp naming style `seed43_YYYYMMDD_HHMMSS` and stores:
 
 Update metrics include the raw/effective GRU gate, separate backbone/recurrent
 learning rates, and moving/stopped XY, Z, velocity and joint good fractions.
+Vertical-task rows additionally contain height/vertical-velocity good
+fractions, vertical gate state and per-primitive vertical velocity error.
 Those conditions are also split by primitive in
 `plots/primitive_conditions.png`; `condition_diagnostics.png` and
 `episode_condition_fractions.png` expose the main success bottleneck directly.

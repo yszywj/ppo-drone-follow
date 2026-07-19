@@ -363,6 +363,11 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         axes[1].set_ylabel("error")
         axes[2].plot(x, [r["mean_speed_xy"] for r in update_rows], label="speed xy")
         axes[2].plot(x, [r["mean_tracking_velocity_error"] for r in update_rows], label="tracking velocity error")
+        axes[2].plot(
+            x,
+            [r.get("mean_vertical_motion_velocity_error", 0.0) for r in update_rows],
+            label="vertical motion velocity error",
+        )
         axes[2].legend()
         axes[2].set_ylabel("speed")
         axes[3].plot(x, [r["success_count"] for r in update_rows], label="success")
@@ -409,7 +414,7 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         fig.savefig(plot_dir / "phase_and_stopping.png", dpi=150)
         plt.close(fig)
 
-        fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
+        fig, axes = plt.subplots(4, 1, figsize=(11, 13), sharex=True)
         axes[0].plot(
             x,
             [r.get("moving_xy_good_sample_fraction", 0.0) for r in update_rows],
@@ -435,35 +440,53 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         axes[0].legend()
         axes[1].plot(
             x,
+            [r.get("vertical_position_good_sample_fraction", 0.0) for r in update_rows],
+            label="position",
+        )
+        axes[1].plot(
+            x,
+            [r.get("vertical_velocity_good_sample_fraction", 0.0) for r in update_rows],
+            label="vertical velocity",
+        )
+        axes[1].plot(
+            x,
+            [r.get("vertical_good_sample_fraction", 0.0) for r in update_rows],
+            label="joint",
+        )
+        axes[1].set_ylim(0.0, 1.05)
+        axes[1].set_ylabel("vertical fraction")
+        axes[1].legend()
+        axes[2].plot(
+            x,
             [r.get("stopped_xy_good_sample_fraction", 0.0) for r in update_rows],
             label="XY",
         )
-        axes[1].plot(
+        axes[2].plot(
             x,
             [r.get("stopped_z_good_sample_fraction", 0.0) for r in update_rows],
             label="Z",
         )
-        axes[1].plot(
+        axes[2].plot(
             x,
             [r.get("stopped_speed_good_sample_fraction", 0.0) for r in update_rows],
             label="speed",
         )
-        axes[1].set_ylim(0.0, 1.05)
-        axes[1].set_ylabel("stopped fraction")
-        axes[1].legend()
-        axes[2].plot(
+        axes[2].set_ylim(0.0, 1.05)
+        axes[2].set_ylabel("stopped fraction")
+        axes[2].legend()
+        axes[3].plot(
             x,
             [r.get("temporal_gate_raw", 0.0) for r in update_rows],
             label="raw gate",
         )
-        axes[2].plot(
+        axes[3].plot(
             x,
             [r.get("temporal_gate_effective", 0.0) for r in update_rows],
             label="tanh(gate)",
         )
-        axes[2].set_ylabel("GRU residual gate")
-        axes[2].set_xlabel("env steps")
-        axes[2].legend()
+        axes[3].set_ylabel("GRU residual gate")
+        axes[3].set_xlabel("env steps")
+        axes[3].legend()
         fig.tight_layout()
         fig.savefig(plot_dir / "condition_diagnostics.png", dpi=150)
         plt.close(fig)
@@ -492,6 +515,16 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
             x,
             [r.get("mean_reward_moving_position", 0.0) for r in update_rows],
             label="moving position",
+        )
+        axes[0].plot(
+            x,
+            [r.get("mean_reward_moving_progress", 0.0) for r in update_rows],
+            label="moving progress",
+        )
+        axes[0].plot(
+            x,
+            [r.get("mean_reward_moving_recovery", 0.0) for r in update_rows],
+            label="moving recovery",
         )
         axes[0].plot(
             x,
@@ -533,7 +566,12 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
 
         primitive_metrics = (
             ("primitive_mean_xy_err", "mean XY error"),
+            ("primitive_mean_z_err", "mean Z error"),
             ("primitive_mean_velocity_error", "mean velocity error"),
+            (
+                "primitive_mean_vertical_velocity_error",
+                "mean vertical velocity error",
+            ),
             ("primitive_good_fraction", "good fraction"),
         )
         parsed_metrics = {
@@ -555,7 +593,7 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
             }
         )
         if primitive_names:
-            fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
+            fig, axes = plt.subplots(5, 1, figsize=(11, 16), sharex=True)
             for axis, (metric, ylabel) in zip(axes, primitive_metrics):
                 rows = parsed_metrics[metric]
                 for primitive in primitive_names:
@@ -575,6 +613,10 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
                 ("primitive_xy_good_fraction", "XY good fraction"),
                 ("primitive_z_good_fraction", "Z good fraction"),
                 ("primitive_velocity_good_fraction", "velocity good fraction"),
+                (
+                    "primitive_vertical_velocity_good_fraction",
+                    "vertical velocity good fraction",
+                ),
                 ("primitive_good_fraction", "joint good fraction"),
             )
             parsed_conditions = {
@@ -586,7 +628,7 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
                 ]
                 for metric, _ in condition_metrics
             }
-            fig, axes = plt.subplots(4, 1, figsize=(11, 13), sharex=True)
+            fig, axes = plt.subplots(5, 1, figsize=(11, 16), sharex=True)
             for axis, (metric, ylabel) in zip(axes, condition_metrics):
                 rows = parsed_conditions[metric]
                 for primitive in primitive_names:
@@ -642,6 +684,9 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         z_tolerance = float(run_args.get("tracking_z_tolerance_m", 0.35))
         speed_tolerance = float(run_args.get("stopped_speed_xy_tolerance_mps", 0.25))
         moving_good_tolerance = float(run_args.get("moving_success_min_fraction", 0.5))
+        vertical_good_tolerance = float(
+            run_args.get("vertical_success_min_fraction", 0.75)
+        )
         episode_index = np.arange(1, len(episode_rows) + 1)
         colors = ["tab:green" if r["success"] else "tab:red" for r in episode_rows]
         cumulative_success = np.cumsum(success_flags) / episode_index
@@ -705,7 +750,7 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         fig.savefig(plot_dir / "episode_outcomes.png", dpi=150)
         plt.close(fig)
 
-        fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        fig, axes = plt.subplots(3, 1, figsize=(12, 11), sharex=True)
         for key, label in (
             ("moving_xy_good_fraction", "XY"),
             ("moving_z_good_fraction", "Z"),
@@ -723,9 +768,9 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         axes[0].set_ylabel("moving fraction")
         axes[0].legend()
         for key, label in (
-            ("stopped_xy_good_fraction", "XY"),
-            ("stopped_z_good_fraction", "Z"),
-            ("stopped_speed_good_fraction", "speed"),
+            ("vertical_position_good_fraction", "position"),
+            ("vertical_velocity_good_fraction", "vertical velocity"),
+            ("vertical_good_fraction", "joint"),
         ):
             axes[1].plot(
                 episode_index,
@@ -735,9 +780,30 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
                 label=label,
             )
         axes[1].set_ylim(0.0, 1.05)
-        axes[1].set_ylabel("stopped fraction")
-        axes[1].set_xlabel("completed episode")
+        axes[1].axhline(
+            vertical_good_tolerance,
+            color="tab:red",
+            linestyle="--",
+            label="vertical success threshold",
+        )
+        axes[1].set_ylabel("vertical fraction")
         axes[1].legend()
+        for key, label in (
+            ("stopped_xy_good_fraction", "XY"),
+            ("stopped_z_good_fraction", "Z"),
+            ("stopped_speed_good_fraction", "speed"),
+        ):
+            axes[2].plot(
+                episode_index,
+                [r.get(key, 0.0) for r in episode_rows],
+                ".",
+                markersize=3,
+                label=label,
+            )
+        axes[2].set_ylim(0.0, 1.05)
+        axes[2].set_ylabel("stopped fraction")
+        axes[2].set_xlabel("completed episode")
+        axes[2].legend()
         fig.tight_layout()
         fig.savefig(plot_dir / "episode_condition_fractions.png", dpi=150)
         plt.close(fig)
@@ -927,6 +993,11 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         )
         axes[0].plot(
             x,
+            [r.get("return_moving_recovery", 0.0) for r in episode_rows],
+            label="moving recovery",
+        )
+        axes[0].plot(
+            x,
             [r.get("return_stopped_position", 0.0) for r in episode_rows],
             label="stopped position",
         )
@@ -1038,6 +1109,7 @@ def restore_training_state(
     actor_optimizer: torch.optim.Optimizer,
     critic_optimizer: torch.optim.Optimizer,
     env_rng: np.random.Generator | None = None,
+    restore_rng: bool = True,
 ) -> bool:
     actor_state = checkpoint_payload.get("actor_optimizer_state")
     critic_state = checkpoint_payload.get("critic_optimizer_state")
@@ -1050,6 +1122,9 @@ def restore_training_state(
     except (ValueError, KeyError) as exc:
         print(f"[FAST PPO] optimizer state is incompatible ({exc}); optimizers start fresh")
         return False
+    if not restore_rng:
+        print("[FAST PPO] restored actor/critic optimizer states; kept configured RNG seed")
+        return True
     rng_restored = True
     try:
         if "python_random_state" in checkpoint_payload:

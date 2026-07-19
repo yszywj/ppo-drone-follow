@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 import time
+import traceback
 from collections import Counter
 from pathlib import Path
 
@@ -19,7 +21,7 @@ from pegasus_iris_fast_line_follow.training_config import (
     resolve_path_from_config,
 )
 
-DEFAULT_RESULTS_ROOT = SCRIPT_DIR / "result" / "train"
+DEFAULT_RESULTS_ROOT = SCRIPT_DIR / "result" / "ppo_train"
 
 
 def format_duration(seconds: float) -> str:
@@ -53,7 +55,7 @@ def parse_args():
     parser.add_argument("--rendering_dt", type=float, default=1.0 / 60.0)
     parser.add_argument("--env_spacing_m", type=float, default=8.0)
     parser.add_argument("--takeoff_altitude", type=float, default=5.0)
-    parser.add_argument("--seed", type=int, default=43)
+    parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--cuda", action="store_true", default=False)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--gui", action="store_true", default=False)
@@ -93,8 +95,17 @@ def parse_args():
     parser.add_argument("--load_checkpoint", type=str, default="")
     parser.add_argument("--allow_partial_checkpoint", action="store_true", default=False)
     parser.add_argument("--reset_optimizer", action="store_true", default=False)
+    parser.add_argument(
+        "--reset_rng_on_load",
+        action="store_true",
+        default=False,
+        help="Keep the configured seed instead of restoring RNG states from a checkpoint.",
+    )
     parser.add_argument("--from_scratch", action="store_true", default=False)
     parser.add_argument("--save_interval", type=int, default=10)
+    parser.add_argument("--best_checkpoint_window", type=int, default=0)
+    parser.add_argument("--early_stop_patience_updates", type=int, default=0)
+    parser.add_argument("--early_stop_drop_threshold", type=float, default=0.0)
 
     parser.add_argument(
         "--control_mix_mode",
@@ -133,6 +144,18 @@ def parse_args():
     parser.add_argument("--z_feedback_scale", type=float, default=1.0)
     parser.add_argument("--z_pos_gain", type=float, default=0.04)
     parser.add_argument("--z_vel_gain", type=float, default=0.06)
+    parser.add_argument(
+        "--z_target_velocity_gain",
+        type=float,
+        default=0.0,
+        help="Target NED vertical-velocity feedforward gain; zero reproduces the old helper.",
+    )
+    parser.add_argument(
+        "--z_target_accel_gain",
+        type=float,
+        default=0.0,
+        help="Target NED vertical-acceleration feedforward gain; helper-only privileged input.",
+    )
     parser.add_argument("--safety_max_xy_from_home", type=float, default=5.5)
 
     parser.add_argument("--mass_kg", type=float, default=1.52)
@@ -159,6 +182,18 @@ def parse_args():
     parser.add_argument("--target_decel_sec", type=float, default=2.0)
     parser.add_argument("--target_stopped_speed_threshold_mps", type=float, default=0.05)
     parser.add_argument("--target_accel_observation_filter_alpha", type=float, default=0.5)
+    parser.add_argument(
+        "--actor_mask_target_acceleration",
+        action="store_true",
+        default=False,
+        help="Keep the 3 Actor acceleration slots but fill them with zero.",
+    )
+    parser.add_argument(
+        "--no_actor_mask_target_acceleration",
+        action="store_false",
+        dest="actor_mask_target_acceleration",
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument("--target_z_delta_m", type=float, default=0.0)
     parser.add_argument("--follow_vertical_offset_m", type=float, default=0.0)
     parser.add_argument("--line_yaw_deg", type=float, default=0.0)
@@ -176,6 +211,13 @@ def parse_args():
     parser.add_argument("--moving_success_min_fraction", type=float, default=0.50)
     parser.add_argument("--moving_success_xy_tolerance_m", type=float, default=0.60)
     parser.add_argument("--moving_success_velocity_tolerance_mps", type=float, default=0.35)
+    parser.add_argument("--vertical_motion_z_tolerance_m", type=float, default=0.30)
+    parser.add_argument(
+        "--vertical_motion_velocity_tolerance_mps",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument("--vertical_success_min_fraction", type=float, default=0.75)
     parser.add_argument("--stopped_success_dwell_sec", type=float, default=2.0)
     parser.add_argument("--capture_radius_m", type=float, default=0.80)
     parser.add_argument("--capture_hold_sec", type=float, default=1.0)
@@ -184,6 +226,11 @@ def parse_args():
     parser.add_argument("--reward_capture_tracking_scale", type=float, default=1.0)
     parser.add_argument("--reward_moving_good", type=float, default=0.10)
     parser.add_argument("--reward_moving_joint_scale", type=float, default=1.0)
+    parser.add_argument("--reward_moving_progress_scale", type=float, default=0.0)
+    parser.add_argument("--moving_progress_clip_m", type=float, default=0.10)
+    parser.add_argument("--reward_position_recovery_scale", type=float, default=0.0)
+    parser.add_argument("--reward_velocity_correction_gain", type=float, default=0.0)
+    parser.add_argument("--reward_velocity_correction_max_mps", type=float, default=0.0)
     parser.add_argument("--max_tracking_error_m", type=float, default=3.0)
     parser.add_argument("--min_target_distance_m", type=float, default=0.35)
 
@@ -209,6 +256,8 @@ def parse_args():
     parser.add_argument("--reward_too_close_scale", type=float, default=1.5)
     parser.add_argument("--position_sigma_m", type=float, default=0.75)
     parser.add_argument("--z_sigma_m", type=float, default=0.50)
+    parser.add_argument("--position_recovery_sigma_m", type=float, default=1.50)
+    parser.add_argument("--z_recovery_sigma_m", type=float, default=0.80)
     parser.add_argument("--velocity_sigma_mps", type=float, default=0.50)
     parser.add_argument("--stop_speed_sigma_mps", type=float, default=0.30)
     parser.add_argument("--reward_action_delta_scale", type=float, default=0.02)
@@ -221,6 +270,7 @@ def parse_args():
     )
 
     parser.add_argument("--results_root", type=str, default=str(DEFAULT_RESULTS_ROOT))
+    parser.add_argument("--task_description", type=str, default=argparse.SUPPRESS)
     parser.add_argument("--no_terminal_log", action="store_true", default=False)
     parser.add_argument("--no_tensorboard", action="store_true", default=False)
     parser.add_argument("--live_plot_interval", type=int, default=5)
@@ -253,6 +303,11 @@ def parse_args():
         parser.error("--recurrent_hidden_size must be positive")
     if args.temporal_gate_warmup_updates < 0:
         parser.error("--temporal_gate_warmup_updates must be non-negative")
+    for name in ("best_checkpoint_window", "early_stop_patience_updates"):
+        if getattr(args, name) < 0:
+            parser.error(f"--{name} must be non-negative")
+    if args.early_stop_patience_updates > 0 and args.best_checkpoint_window <= 0:
+        parser.error("--early_stop_patience_updates requires --best_checkpoint_window")
     if abs(args.temporal_gate_init) > 3.0:
         parser.error("--temporal_gate_init must be in [-3, 3]")
     for name in ("actor_backbone_lr_multiplier", "actor_recurrent_lr_multiplier"):
@@ -272,6 +327,11 @@ def parse_args():
         "reward_velocity_scale",
         "reward_capture_tracking_scale",
         "reward_moving_joint_scale",
+        "reward_moving_progress_scale",
+        "moving_progress_clip_m",
+        "reward_position_recovery_scale",
+        "reward_velocity_correction_gain",
+        "reward_velocity_correction_max_mps",
         "reward_stop_speed_scale",
         "reward_braking_scale",
         "reward_stop_overspeed_scale",
@@ -280,6 +340,8 @@ def parse_args():
         "stopped_max_approach_speed_mps",
         "position_sigma_m",
         "z_sigma_m",
+        "position_recovery_sigma_m",
+        "z_recovery_sigma_m",
         "velocity_sigma_mps",
         "stop_speed_sigma_mps",
         "target_accel_sec",
@@ -291,6 +353,9 @@ def parse_args():
         "moving_success_min_fraction",
         "moving_success_xy_tolerance_m",
         "moving_success_velocity_tolerance_mps",
+        "vertical_motion_z_tolerance_m",
+        "vertical_motion_velocity_tolerance_mps",
+        "vertical_success_min_fraction",
         "capture_radius_m",
         "capture_hold_sec",
         "reward_capture_once",
@@ -299,6 +364,7 @@ def parse_args():
         "reward_action_delta_scale",
         "reward_tilt_scale",
         "reward_control_scale",
+        "early_stop_drop_threshold",
         "goal_xy_pos_gain",
         "xy_velocity_damping_gain",
         "xy_target_velocity_gain",
@@ -307,10 +373,19 @@ def parse_args():
         "max_roll_rate",
         "max_pitch_rate",
         "max_yaw_rate",
+        "z_feedback_scale",
+        "z_pos_gain",
+        "z_vel_gain",
+        "z_target_velocity_gain",
+        "z_target_accel_gain",
     ):
         if getattr(args, name) < 0.0:
             parser.error(f"--{name} must be non-negative")
-    for name in ("moving_reward_min_progress_fraction", "moving_success_min_fraction"):
+    for name in (
+        "moving_reward_min_progress_fraction",
+        "moving_success_min_fraction",
+        "vertical_success_min_fraction",
+    ):
         if getattr(args, name) > 1.0:
             parser.error(f"--{name} must be in [0, 1]")
     if not 0.0 <= args.target_accel_observation_filter_alpha <= 1.0:
@@ -404,6 +479,8 @@ def main():
         z_feedback_scale=args.z_feedback_scale,
         z_pos_gain=args.z_pos_gain,
         z_vel_gain=args.z_vel_gain,
+        z_target_velocity_gain=args.z_target_velocity_gain,
+        z_target_accel_gain=args.z_target_accel_gain,
     )
     motion_pool_cfg = MotionPoolConfig.from_dict(args.motion_pool_config)
     max_requested_line_length = (
@@ -468,6 +545,7 @@ def main():
         reward_crash=args.reward_crash,
         reward_timeout=args.reward_timeout,
         target_accel_observation_filter_alpha=args.target_accel_observation_filter_alpha,
+        actor_mask_target_acceleration=args.actor_mask_target_acceleration,
         action_limits=action_limits,
         safety_limits=safety_limits,
         backend_config=backend_cfg,
@@ -499,6 +577,11 @@ def main():
         moving_success_min_fraction=args.moving_success_min_fraction,
         moving_success_xy_tolerance_m=args.moving_success_xy_tolerance_m,
         moving_success_velocity_tolerance_mps=args.moving_success_velocity_tolerance_mps,
+        vertical_motion_z_tolerance_m=args.vertical_motion_z_tolerance_m,
+        vertical_motion_velocity_tolerance_mps=(
+            args.vertical_motion_velocity_tolerance_mps
+        ),
+        vertical_success_min_fraction=args.vertical_success_min_fraction,
         stopped_success_dwell_sec=args.stopped_success_dwell_sec,
         capture_radius_m=args.capture_radius_m,
         capture_hold_sec=args.capture_hold_sec,
@@ -507,6 +590,13 @@ def main():
         reward_capture_tracking_scale=args.reward_capture_tracking_scale,
         reward_moving_good=args.reward_moving_good,
         reward_moving_joint_scale=args.reward_moving_joint_scale,
+        reward_moving_progress_scale=args.reward_moving_progress_scale,
+        moving_progress_clip_m=args.moving_progress_clip_m,
+        reward_position_recovery_scale=args.reward_position_recovery_scale,
+        reward_velocity_correction_gain=args.reward_velocity_correction_gain,
+        reward_velocity_correction_max_mps=(
+            args.reward_velocity_correction_max_mps
+        ),
         max_tracking_error_m=args.max_tracking_error_m,
         min_target_distance_m=args.min_target_distance_m,
         reward_position_scale=args.reward_position_scale,
@@ -521,6 +611,8 @@ def main():
         reward_too_close_scale=args.reward_too_close_scale,
         position_sigma_m=args.position_sigma_m,
         z_sigma_m=args.z_sigma_m,
+        position_recovery_sigma_m=args.position_recovery_sigma_m,
+        z_recovery_sigma_m=args.z_recovery_sigma_m,
         velocity_sigma_mps=args.velocity_sigma_mps,
         stop_speed_sigma_mps=args.stop_speed_sigma_mps,
         reward_action_delta_scale=args.reward_action_delta_scale,
@@ -537,6 +629,7 @@ def main():
     episode_rows = []
     total_steps = 0
     update = 0
+    early_stopped = False
     start_wall = time.perf_counter()
     run_started_at = time.time()
     update_fields = [
@@ -554,6 +647,9 @@ def main():
         "mean_z_err",
         "max_z_err",
         "mean_signed_z_err",
+        "mean_vertical_velocity_error",
+        "mean_vertical_motion_velocity_error",
+        "max_vertical_motion_velocity_error",
         "mean_goal_xy_progress",
         "goal_zone_fraction",
         "mean_goal_dwell_fraction",
@@ -565,14 +661,21 @@ def main():
         "success_count",
         "timeout_count",
         "other_done_count",
+        "checkpoint_score",
+        "best_checkpoint_score",
+        "best_checkpoint_update",
+        "degradation_updates",
+        "early_stop_triggered",
         "done_reasons",
         "primitive_sample_counts",
         "primitive_mean_xy_err",
         "primitive_mean_z_err",
         "primitive_mean_velocity_error",
+        "primitive_mean_vertical_velocity_error",
         "primitive_xy_good_fraction",
         "primitive_z_good_fraction",
         "primitive_velocity_good_fraction",
+        "primitive_vertical_velocity_good_fraction",
         "primitive_good_fraction",
         "approx_kl",
         "clip_fraction",
@@ -591,6 +694,8 @@ def main():
         "action_abs_mean",
         "mean_target_speed",
         "mean_tracking_velocity_error",
+        "mean_reward_velocity_error",
+        "mean_reward_velocity_correction_speed",
         "mean_target_distance",
         "mean_target_progress_fraction",
         "capture_acquired_fraction",
@@ -601,6 +706,11 @@ def main():
         "moving_z_good_sample_fraction",
         "moving_velocity_good_sample_fraction",
         "moving_good_sample_fraction",
+        "vertical_success_met_fraction",
+        "mean_vertical_good_fraction",
+        "vertical_position_good_sample_fraction",
+        "vertical_velocity_good_sample_fraction",
+        "vertical_good_sample_fraction",
         "capture_phase_fraction",
         "moving_phase_fraction",
         "decelerating_phase_fraction",
@@ -657,6 +767,7 @@ def main():
         "final_target_speed",
         "final_target_distance",
         "final_tracking_velocity_error",
+        "final_vertical_velocity_error",
         "final_desired_approach_speed",
         "final_allowed_stopped_speed",
         "final_stopped_velocity_error",
@@ -686,6 +797,14 @@ def main():
         "moving_xy_good_fraction",
         "moving_z_good_fraction",
         "moving_velocity_good_fraction",
+        "vertical_success_met",
+        "vertical_eligible_steps",
+        "vertical_position_good_steps",
+        "vertical_velocity_good_steps",
+        "vertical_good_steps",
+        "vertical_position_good_fraction",
+        "vertical_velocity_good_fraction",
+        "vertical_good_fraction",
         "stopped_track_dwell_steps",
         "required_stopped_track_steps",
         "stopped_eligible_steps",
@@ -703,6 +822,8 @@ def main():
         "max_speed_xy",
         "mean_tracking_velocity_error",
         "max_tracking_velocity_error",
+        "mean_vertical_motion_velocity_error",
+        "max_vertical_motion_velocity_error",
         "max_goal_dwell_fraction",
         "capture_phase_steps",
         "moving_phase_steps",
@@ -720,6 +841,9 @@ def main():
     episode_speed_xy_max = np.zeros(args.num_envs, dtype=np.float64)
     episode_tracking_vel_sums = np.zeros(args.num_envs, dtype=np.float64)
     episode_tracking_vel_max = np.zeros(args.num_envs, dtype=np.float64)
+    episode_vertical_vel_sums = np.zeros(args.num_envs, dtype=np.float64)
+    episode_vertical_vel_max = np.zeros(args.num_envs, dtype=np.float64)
+    episode_vertical_vel_samples = np.zeros(args.num_envs, dtype=np.int64)
     episode_max_dwell = np.zeros(args.num_envs, dtype=np.float64)
     episode_phase_steps = {
         phase: np.zeros(args.num_envs, dtype=np.int64)
@@ -731,7 +855,14 @@ def main():
     }
 
     try:
+        print("[FAST PPO] initializing vector environment...", flush=True)
         env = FastIrisLineFollowVecEnv(env_cfg, task_cfg)
+        print(
+            f"[FAST PPO] vector environment initialized: num_envs={env.num_envs}, "
+            f"actor_obs={env.obs_dim}, critic_obs={env.critic_obs_dim}",
+            flush=True,
+        )
+        print(f"[FAST PPO] initializing ActorCritic on {device}...", flush=True)
         policy = ActorCritic(
             env.obs_dim,
             env.action_dim,
@@ -743,6 +874,7 @@ def main():
             activation=args.activation,
             init_std=args.init_action_std,
         ).to(device)
+        print("[FAST PPO] ActorCritic initialized", flush=True)
         checkpoint_payload = {}
         if args.from_scratch:
             print("[FAST PPO] starting from scratch")
@@ -792,6 +924,7 @@ def main():
                 actor_optimizer,
                 critic_optimizer,
                 env_rng=env._rng,
+                restore_rng=not args.reset_rng_on_load,
             )
         temporal_gate_frozen = args.temporal_gate_warmup_updates > 0
         policy.temporal_gate.requires_grad_(not temporal_gate_frozen)
@@ -804,6 +937,8 @@ def main():
         print("=" * 88)
         print("Fast no-PX4 Pegasus Iris line-follow PPO")
         print(f"run_dir: {run_dir}")
+        if hasattr(args, "task_description"):
+            print(f"task_description: {args.task_description}")
         print(f"device: {device}")
         print(f"num_envs: {args.num_envs}, rollout_steps: {args.rollout_steps}, batch/update: {args.num_envs * args.rollout_steps}")
         print(
@@ -842,6 +977,8 @@ def main():
                 "task_pool: "
                 f"prefix={list(motion_pool_cfg.prefix_ids)}, "
                 f"sample_from={list(motion_pool_cfg.primitive_ids)}, "
+                f"required={list(motion_pool_cfg.required_ids)}, "
+                f"required_one_of={list(motion_pool_cfg.required_one_of_ids)}, "
                 f"segments=[{motion_pool_cfg.min_segments}, {motion_pool_cfg.max_segments}], "
                 f"future_reference={list(motion_pool_cfg.reference_horizon_sec)}s"
             )
@@ -882,14 +1019,28 @@ def main():
             f"target_accel_gain={args.xy_target_accel_gain}, "
             f"xy_tilt_limit={args.xy_max_tilt_cmd}, "
             f"rate_limits=({args.max_roll_rate}, {args.max_pitch_rate}, {args.max_yaw_rate}), "
-            f"z_feedback_scale={args.z_feedback_scale}"
+            f"z_feedback_scale={args.z_feedback_scale}, "
+            f"z_gains=(pos={args.z_pos_gain}, own_vel={args.z_vel_gain}, "
+            f"target_vel={args.z_target_velocity_gain}, "
+            f"target_accel={args.z_target_accel_gain})"
+        )
+        print(
+            "actor_observation: "
+            f"target_acceleration_masked={args.actor_mask_target_acceleration}; "
+            "Critic privileged target/reference acceleration remains enabled"
         )
         print(
             "reward_3d_continuous: "
             f"position={args.reward_position_scale}, velocity={args.reward_velocity_scale}, "
             f"joint={args.reward_moving_joint_scale}, "
+            f"moving_progress={args.reward_moving_progress_scale}, "
+            f"recovery={args.reward_position_recovery_scale}, "
             f"position_sigma_xy={args.position_sigma_m}, sigma_z={args.z_sigma_m}, "
+            f"recovery_sigma_xy={args.position_recovery_sigma_m}, "
+            f"recovery_sigma_z={args.z_recovery_sigma_m}, "
             f"velocity_sigma={args.velocity_sigma_mps}, "
+            f"velocity_correction=(gain={args.reward_velocity_correction_gain}, "
+            f"max={args.reward_velocity_correction_max_mps}), "
             f"action_delta={args.reward_action_delta_scale}, tilt={args.reward_tilt_scale}, "
             f"dt_scaled={args.reward_scale_by_dt}, "
             f"capture_once={args.reward_capture_once}, capture_hold={args.reward_capture_hold}, "
@@ -911,6 +1062,9 @@ def main():
             f"moving_good_fraction>={args.moving_success_min_fraction}, "
             f"moving_xy_tol={args.moving_success_xy_tolerance_m}, "
             f"moving_vel_tol={args.moving_success_velocity_tolerance_mps}, "
+            f"vertical_good_fraction>={args.vertical_success_min_fraction}, "
+            f"vertical_z_tol={args.vertical_motion_z_tolerance_m}, "
+            f"vertical_vel_tol={args.vertical_motion_velocity_tolerance_mps}, "
             f"stopped_dwell={args.stopped_success_dwell_sec}s"
         )
         print("PX4/MAVLink: disabled; CTBR commands are converted by local rate controller backend")
@@ -921,6 +1075,9 @@ def main():
         critic_obs = env.build_critic_obs(obs)
         recurrent_hidden = policy.initial_state(args.num_envs, device=device)
         episode_start = np.ones(args.num_envs, dtype=bool)
+        best_checkpoint_score = -math.inf
+        best_checkpoint_update = 0
+        degradation_updates = 0
         while total_steps < args.num_env_steps:
             if temporal_gate_frozen and update >= args.temporal_gate_warmup_updates:
                 policy.temporal_gate.requires_grad_(True)
@@ -951,6 +1108,10 @@ def main():
             stats_speed_z = []
             stats_target_speed = []
             stats_tracking_vel = []
+            stats_reward_velocity_error = []
+            stats_reward_velocity_correction_speed = []
+            stats_vertical_vel = []
+            stats_vertical_motion_vel = []
             stats_target_distance = []
             stats_target_progress = []
             stats_capture_acquired = []
@@ -961,14 +1122,23 @@ def main():
             stats_moving_z_good_sample = []
             stats_moving_velocity_good_sample = []
             stats_moving_good_sample = []
+            stats_vertical_met = []
+            stats_vertical_good_fraction = []
+            stats_vertical_position_good_sample = []
+            stats_vertical_velocity_good_sample = []
+            stats_vertical_good_sample = []
             stats_phases = Counter()
             stats_primitives = Counter()
             stats_primitive_xy = {key: [] for key in PRIMITIVE_CODES}
             stats_primitive_z = {key: [] for key in PRIMITIVE_CODES}
             stats_primitive_velocity = {key: [] for key in PRIMITIVE_CODES}
+            stats_primitive_vertical_velocity = {key: [] for key in PRIMITIVE_CODES}
             stats_primitive_xy_good = {key: [] for key in PRIMITIVE_CODES}
             stats_primitive_z_good = {key: [] for key in PRIMITIVE_CODES}
             stats_primitive_velocity_good = {key: [] for key in PRIMITIVE_CODES}
+            stats_primitive_vertical_velocity_good = {
+                key: [] for key in PRIMITIVE_CODES
+            }
             stats_primitive_good = {key: [] for key in PRIMITIVE_CODES}
             stats_stopped_xy = []
             stats_stopped_speed_xy = []
@@ -1020,6 +1190,11 @@ def main():
                     speed_xy = float(info.get("speed_xy", 0.0))
                     speed_z = float(info.get("speed_z", 0.0))
                     tracking_vel_err = float(info.get("tracking_velocity_error", 0.0))
+                    reward_vel_err = float(info.get("reward_velocity_error", 0.0))
+                    reward_vel_correction_speed = float(
+                        info.get("reward_velocity_correction_speed", 0.0)
+                    )
+                    vertical_vel_err = float(info.get("vertical_velocity_error", 0.0))
                     dwell_fraction = float(info.get("goal_dwell_fraction", 0.0))
                     phase = str(info.get("target_phase", "unknown"))
                     stats_reasons[reason] += 1
@@ -1033,6 +1208,11 @@ def main():
                     stats_speed_z.append(speed_z)
                     stats_target_speed.append(float(info.get("target_speed", 0.0)))
                     stats_tracking_vel.append(tracking_vel_err)
+                    stats_reward_velocity_error.append(reward_vel_err)
+                    stats_reward_velocity_correction_speed.append(
+                        reward_vel_correction_speed
+                    )
+                    stats_vertical_vel.append(vertical_vel_err)
                     stats_target_distance.append(float(info.get("target_distance", 0.0)))
                     stats_target_progress.append(float(info.get("target_progress_fraction", 0.0)))
                     stats_capture_acquired.append(1.0 if info.get("capture_acquired") else 0.0)
@@ -1053,6 +1233,26 @@ def main():
                         stats_moving_good_sample.append(
                             1.0 if info.get("moving_good") else 0.0
                         )
+                    vertical_motion_eligible = bool(
+                        info.get("vertical_motion_eligible", False)
+                    )
+                    if vertical_motion_eligible:
+                        stats_vertical_motion_vel.append(vertical_vel_err)
+                        stats_vertical_met.append(
+                            1.0 if info.get("vertical_success_met") else 0.0
+                        )
+                        stats_vertical_good_fraction.append(
+                            float(info.get("vertical_good_fraction", 0.0))
+                        )
+                        stats_vertical_position_good_sample.append(
+                            1.0 if info.get("vertical_position_good") else 0.0
+                        )
+                        stats_vertical_velocity_good_sample.append(
+                            1.0 if info.get("vertical_velocity_good") else 0.0
+                        )
+                        stats_vertical_good_sample.append(
+                            1.0 if info.get("vertical_good") else 0.0
+                        )
                     stats_phases[phase] += 1
                     primitive_id = str(info.get("primitive_id", "unknown"))
                     stats_primitives[primitive_id] += 1
@@ -1071,6 +1271,13 @@ def main():
                         )
                         stats_primitive_good[primitive_id].append(
                             1.0 if info.get("moving_good") else 0.0
+                        )
+                    if primitive_id in stats_primitive_xy and vertical_motion_eligible:
+                        stats_primitive_vertical_velocity[primitive_id].append(
+                            vertical_vel_err
+                        )
+                        stats_primitive_vertical_velocity_good[primitive_id].append(
+                            1.0 if info.get("vertical_velocity_good") else 0.0
                         )
                     stats_braking_progress.append(float(info.get("braking_progress", 0.0)))
                     if bool(info.get("target_stopped", False)):
@@ -1114,6 +1321,13 @@ def main():
                         episode_tracking_vel_max[env_id],
                         tracking_vel_err,
                     )
+                    if vertical_motion_eligible:
+                        episode_vertical_vel_sums[env_id] += vertical_vel_err
+                        episode_vertical_vel_max[env_id] = max(
+                            episode_vertical_vel_max[env_id],
+                            vertical_vel_err,
+                        )
+                        episode_vertical_vel_samples[env_id] += 1
                     episode_max_dwell[env_id] = max(
                         episode_max_dwell[env_id],
                         dwell_fraction,
@@ -1163,6 +1377,9 @@ def main():
                             "final_target_speed": float(info.get("target_speed", 0.0)),
                             "final_target_distance": float(info.get("target_distance", 0.0)),
                             "final_tracking_velocity_error": float(info.get("tracking_velocity_error", 0.0)),
+                            "final_vertical_velocity_error": float(
+                                info.get("vertical_velocity_error", 0.0)
+                            ),
                             "final_desired_approach_speed": float(
                                 info.get("desired_approach_speed", 0.0)
                             ),
@@ -1208,6 +1425,30 @@ def main():
                             "moving_velocity_good_fraction": float(
                                 info.get("moving_velocity_good_fraction", 0.0)
                             ),
+                            "vertical_success_met": bool(
+                                info.get("vertical_success_met", False)
+                            ),
+                            "vertical_eligible_steps": int(
+                                info.get("vertical_eligible_steps", 0)
+                            ),
+                            "vertical_position_good_steps": int(
+                                info.get("vertical_position_good_steps", 0)
+                            ),
+                            "vertical_velocity_good_steps": int(
+                                info.get("vertical_velocity_good_steps", 0)
+                            ),
+                            "vertical_good_steps": int(
+                                info.get("vertical_good_steps", 0)
+                            ),
+                            "vertical_position_good_fraction": float(
+                                info.get("vertical_position_good_fraction", 0.0)
+                            ),
+                            "vertical_velocity_good_fraction": float(
+                                info.get("vertical_velocity_good_fraction", 0.0)
+                            ),
+                            "vertical_good_fraction": float(
+                                info.get("vertical_good_fraction", 0.0)
+                            ),
                             "stopped_track_dwell_steps": int(info.get("stopped_track_dwell_steps", 0)),
                             "required_stopped_track_steps": int(info.get("required_stopped_track_steps", 0)),
                             "stopped_eligible_steps": int(info.get("stopped_eligible_steps", 0)),
@@ -1237,6 +1478,15 @@ def main():
                             "max_tracking_velocity_error": float(
                                 episode_tracking_vel_max[env_id]
                             ),
+                            "mean_vertical_motion_velocity_error": float(
+                                episode_vertical_vel_sums[env_id]
+                                / episode_vertical_vel_samples[env_id]
+                            )
+                            if episode_vertical_vel_samples[env_id] > 0
+                            else 0.0,
+                            "max_vertical_motion_velocity_error": float(
+                                episode_vertical_vel_max[env_id]
+                            ),
                             "max_goal_dwell_fraction": float(episode_max_dwell[env_id]),
                             "capture_phase_steps": int(episode_phase_steps["capture"][env_id]),
                             "moving_phase_steps": int(episode_phase_steps["moving"][env_id]),
@@ -1263,6 +1513,9 @@ def main():
                         episode_speed_xy_max[env_id] = 0.0
                         episode_tracking_vel_sums[env_id] = 0.0
                         episode_tracking_vel_max[env_id] = 0.0
+                        episode_vertical_vel_sums[env_id] = 0.0
+                        episode_vertical_vel_max[env_id] = 0.0
+                        episode_vertical_vel_samples[env_id] = 0
                         episode_max_dwell[env_id] = 0.0
                         for phase_name in episode_phase_steps:
                             episode_phase_steps[phase_name][env_id] = 0
@@ -1443,6 +1696,19 @@ def main():
                 "mean_z_err": float(np.mean(stats_z)) if stats_z else 0.0,
                 "max_z_err": float(np.max(stats_z)) if stats_z else 0.0,
                 "mean_signed_z_err": float(np.mean(stats_signed_z)) if stats_signed_z else 0.0,
+                "mean_vertical_velocity_error": (
+                    float(np.mean(stats_vertical_vel)) if stats_vertical_vel else 0.0
+                ),
+                "mean_vertical_motion_velocity_error": (
+                    float(np.mean(stats_vertical_motion_vel))
+                    if stats_vertical_motion_vel
+                    else 0.0
+                ),
+                "max_vertical_motion_velocity_error": (
+                    float(np.max(stats_vertical_motion_vel))
+                    if stats_vertical_motion_vel
+                    else 0.0
+                ),
                 "mean_goal_xy_progress": float(np.mean(stats_goal_progress)) if stats_goal_progress else 0.0,
                 "goal_zone_fraction": float(np.mean(stats_inside)) if stats_inside else 0.0,
                 "mean_goal_dwell_fraction": float(np.mean(stats_dwell)) if stats_dwell else 0.0,
@@ -1483,6 +1749,14 @@ def main():
                     },
                     sort_keys=True,
                 ),
+                "primitive_mean_vertical_velocity_error": json.dumps(
+                    {
+                        key: float(np.mean(values))
+                        for key, values in stats_primitive_vertical_velocity.items()
+                        if values
+                    },
+                    sort_keys=True,
+                ),
                 "primitive_xy_good_fraction": json.dumps(
                     {
                         key: float(np.mean(values))
@@ -1503,6 +1777,14 @@ def main():
                     {
                         key: float(np.mean(values))
                         for key, values in stats_primitive_velocity_good.items()
+                        if values
+                    },
+                    sort_keys=True,
+                ),
+                "primitive_vertical_velocity_good_fraction": json.dumps(
+                    {
+                        key: float(np.mean(values))
+                        for key, values in stats_primitive_vertical_velocity_good.items()
                         if values
                     },
                     sort_keys=True,
@@ -1534,6 +1816,16 @@ def main():
                 "action_abs_mean": float(np.mean(np.abs(actions_np))) if actions_np.size else 0.0,
                 "mean_target_speed": float(np.mean(stats_target_speed)) if stats_target_speed else 0.0,
                 "mean_tracking_velocity_error": float(np.mean(stats_tracking_vel)) if stats_tracking_vel else 0.0,
+                "mean_reward_velocity_error": (
+                    float(np.mean(stats_reward_velocity_error))
+                    if stats_reward_velocity_error
+                    else 0.0
+                ),
+                "mean_reward_velocity_correction_speed": (
+                    float(np.mean(stats_reward_velocity_correction_speed))
+                    if stats_reward_velocity_correction_speed
+                    else 0.0
+                ),
                 "mean_target_distance": float(np.mean(stats_target_distance)) if stats_target_distance else 0.0,
                 "mean_target_progress_fraction": float(np.mean(stats_target_progress)) if stats_target_progress else 0.0,
                 "capture_acquired_fraction": (
@@ -1566,6 +1858,29 @@ def main():
                 "moving_good_sample_fraction": (
                     float(np.mean(stats_moving_good_sample))
                     if stats_moving_good_sample
+                    else 0.0
+                ),
+                "vertical_success_met_fraction": (
+                    float(np.mean(stats_vertical_met)) if stats_vertical_met else 0.0
+                ),
+                "mean_vertical_good_fraction": (
+                    float(np.mean(stats_vertical_good_fraction))
+                    if stats_vertical_good_fraction
+                    else 0.0
+                ),
+                "vertical_position_good_sample_fraction": (
+                    float(np.mean(stats_vertical_position_good_sample))
+                    if stats_vertical_position_good_sample
+                    else 0.0
+                ),
+                "vertical_velocity_good_sample_fraction": (
+                    float(np.mean(stats_vertical_velocity_good_sample))
+                    if stats_vertical_velocity_good_sample
+                    else 0.0
+                ),
+                "vertical_good_sample_fraction": (
+                    float(np.mean(stats_vertical_good_sample))
+                    if stats_vertical_good_sample
                     else 0.0
                 ),
                 "capture_phase_fraction": float(stats_phases.get("capture", 0) / phase_sample_count),
@@ -1627,9 +1942,83 @@ def main():
                 "entropy": float(np.mean(entropies)) if entropies else 0.0,
                 **mean_reward_terms,
             }
+            checkpoint_score = 0.0
+            best_checkpoint_saved = False
+            early_stop_triggered = False
+            if args.best_checkpoint_window > 0:
+                history_count = args.best_checkpoint_window - 1
+                score_rows = [
+                    *(update_rows[-history_count:] if history_count > 0 else []),
+                    update_row,
+                ]
+                if len(score_rows) >= args.best_checkpoint_window:
+                    checkpoint_score = float(
+                        np.mean(
+                            [
+                                0.5 * row["moving_good_sample_fraction"]
+                                + 0.4 * row["moving_xy_good_sample_fraction"]
+                                + 0.1 * row["moving_success_met_fraction"]
+                                for row in score_rows
+                            ]
+                        )
+                    )
+                    if checkpoint_score > best_checkpoint_score:
+                        best_checkpoint_score = checkpoint_score
+                        best_checkpoint_update = update
+                        degradation_updates = 0
+                        best_checkpoint_saved = True
+                    elif (
+                        checkpoint_score
+                        < best_checkpoint_score - args.early_stop_drop_threshold
+                    ):
+                        degradation_updates += 1
+                    else:
+                        degradation_updates = 0
+                    early_stop_triggered = bool(
+                        args.early_stop_patience_updates > 0
+                        and degradation_updates
+                        >= args.early_stop_patience_updates
+                    )
+            update_row.update(
+                {
+                    "checkpoint_score": checkpoint_score,
+                    "best_checkpoint_score": (
+                        best_checkpoint_score
+                        if math.isfinite(best_checkpoint_score)
+                        else 0.0
+                    ),
+                    "best_checkpoint_update": int(best_checkpoint_update),
+                    "degradation_updates": int(degradation_updates),
+                    "early_stop_triggered": early_stop_triggered,
+                }
+            )
             update_rows.append(update_row)
             append_csv_row(metrics_dir / "update_metrics.csv", update_fields, update_row)
             write_tensorboard_scalars(writer, update_row, total_steps)
+            if best_checkpoint_saved:
+                save_policy_checkpoint(
+                    model_dir / "actor_critic_best.pt",
+                    policy,
+                    update,
+                    total_steps,
+                    actor_optimizer,
+                    critic_optimizer,
+                    env._rng,
+                )
+                dump_json(
+                    model_dir / "actor_critic_best.json",
+                    {
+                        "update": int(update),
+                        "total_steps": int(total_steps),
+                        "window": int(args.best_checkpoint_window),
+                        "score": float(best_checkpoint_score),
+                        "metric": (
+                            "0.5*moving_good_sample_fraction + "
+                            "0.4*moving_xy_good_sample_fraction + "
+                            "0.1*moving_success_met_fraction"
+                        ),
+                    },
+                )
             print("=" * 88)
             print(
                 f"[FastIrisLineFollowPPO] update={update}, "
@@ -1647,7 +2036,9 @@ def main():
             print(f"  mean_follow_xy_err: {update_row['mean_xy_err']:.3f}, mean_z_err: {update_row['mean_z_err']:.3f}")
             print(
                 f"  mean_speed_xy: {update_row['mean_speed_xy']:.3f}, "
-                f"mean_tracking_velocity_error: {update_row['mean_tracking_velocity_error']:.3f}"
+                f"mean_tracking_velocity_error: {update_row['mean_tracking_velocity_error']:.3f}, "
+                f"reward_velocity_error: {update_row['mean_reward_velocity_error']:.3f}, "
+                f"correction_speed: {update_row['mean_reward_velocity_correction_speed']:.3f}"
             )
             print(
                 f"  follow_zone_fraction: {update_row['goal_zone_fraction']:.3f}, "
@@ -1662,6 +2053,14 @@ def main():
                 f"z={update_row['moving_z_good_sample_fraction']:.3f}, "
                 f"velocity={update_row['moving_velocity_good_sample_fraction']:.3f}, "
                 f"joint={update_row['moving_good_sample_fraction']:.3f}"
+            )
+            print(
+                "  vertical_conditions: "
+                f"mean_vz_error={update_row['mean_vertical_motion_velocity_error']:.3f}, "
+                f"position={update_row['vertical_position_good_sample_fraction']:.3f}, "
+                f"velocity={update_row['vertical_velocity_good_sample_fraction']:.3f}, "
+                f"joint={update_row['vertical_good_sample_fraction']:.3f}, "
+                f"gate={update_row['vertical_success_met_fraction']:.3f}"
             )
             print(
                 f"  phases: capture={update_row['capture_phase_fraction']:.3f}, "
@@ -1689,6 +2088,16 @@ def main():
             }
             if primitive_good_summary:
                 print(f"  primitive_good_fraction: {primitive_good_summary}")
+            primitive_vertical_summary = {
+                key: round(float(np.mean(values)), 3)
+                for key, values in stats_primitive_vertical_velocity_good.items()
+                if values
+            }
+            if primitive_vertical_summary:
+                print(
+                    "  primitive_vertical_velocity_good_fraction: "
+                    f"{primitive_vertical_summary}"
+                )
             print(
                 f"  approx_kl: {update_row['approx_kl']:.6f}, "
                 f"clip_fraction: {update_row['clip_fraction']:.3f}, "
@@ -1719,6 +2128,7 @@ def main():
                 f"moving_position={update_row['mean_reward_moving_position']:.4f}, "
                 f"moving_velocity={update_row['mean_reward_moving_velocity']:.4f}, "
                 f"moving_good={update_row['mean_reward_moving_good']:.4f}, "
+                f"moving_progress={update_row['mean_reward_moving_progress']:.4f}, "
                 f"stopped_position={update_row['mean_reward_stopped_position']:.4f}, "
                 f"goal_zone={update_row['mean_reward_goal_zone']:.4f}, "
                 f"dwell={update_row['mean_reward_dwell']:.4f}, "
@@ -1728,6 +2138,17 @@ def main():
             print(f"  policy_loss: {update_row['policy_loss']:.6f}, value_loss: {update_row['value_loss']:.6f}, entropy: {update_row['entropy']:.6f}")
             if args.live_plot_interval > 0 and update % args.live_plot_interval == 0:
                 save_training_plots(run_dir, update_rows, episode_rows)
+            if early_stop_triggered:
+                early_stopped = True
+                print(
+                    "[FAST PPO] early stop: rolling checkpoint score "
+                    f"{checkpoint_score:.4f} stayed more than "
+                    f"{args.early_stop_drop_threshold:.4f} below best "
+                    f"{best_checkpoint_score:.4f} for "
+                    f"{degradation_updates} updates; best update="
+                    f"{best_checkpoint_update}"
+                )
+                break
     except KeyboardInterrupt:
         print("\n[FAST PPO] interrupted")
         if policy is not None and actor_optimizer is not None and critic_optimizer is not None:
@@ -1750,6 +2171,14 @@ def main():
                 env._rng if env is not None else None,
             )
             print("[FAST PPO] saved interrupted checkpoint")
+    except BaseException as exc:
+        print(
+            f"[FAST PPO] fatal error: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        traceback.print_exc(file=sys.stderr)
+        raise
     finally:
         if env is not None:
             env.close()
@@ -1759,7 +2188,13 @@ def main():
         dump_json(
             run_dir / "run_summary.json",
             {
-                "status": "completed" if total_steps >= args.num_env_steps else "interrupted",
+                "status": (
+                    "early_stopped"
+                    if early_stopped
+                    else "completed"
+                    if total_steps >= args.num_env_steps
+                    else "interrupted"
+                ),
                 "started_at": time.strftime(
                     "%Y-%m-%d %H:%M:%S",
                     time.localtime(run_started_at),

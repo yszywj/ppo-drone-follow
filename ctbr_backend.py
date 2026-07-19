@@ -69,6 +69,8 @@ class CTBRActionLimits:
     z_feedback_scale: float = 1.0
     z_pos_gain: float = 0.040
     z_vel_gain: float = 0.060
+    z_target_velocity_gain: float = 0.0
+    z_target_accel_gain: float = 0.0
 
     def __post_init__(self) -> None:
         self.control_mix_mode = str(self.control_mix_mode).lower()

@@ -126,6 +126,21 @@ class RecurrentActorCriticTest(unittest.TestCase):
             self.assertTrue(
                 torch.allclose(self.policy.log_std, restored.log_std)
             )
+            kept_rng = np.random.default_rng(999)
+            expected_rng = np.random.default_rng(999)
+            self.assertTrue(
+                restore_training_state(
+                    payload,
+                    restored_actor_optimizer,
+                    restored_critic_optimizer,
+                    env_rng=kept_rng,
+                    restore_rng=False,
+                )
+            )
+            self.assertEqual(
+                int(kept_rng.integers(0, 1_000_000)),
+                int(expected_rng.integers(0, 1_000_000)),
+            )
 
     def test_partial_load_skips_removed_actor_reference_branch(self) -> None:
         with TemporaryDirectory() as directory:

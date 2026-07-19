@@ -42,6 +42,11 @@ from .motion_task import (
     MotionPoolConfig,
     MotionTaskGenerator,
 )
+from .reward_shaping import (
+    clipped_error_progress,
+    corrective_velocity_reference,
+    position_reward_qualities,
+)
 
 
 REWARD_TERM_KEYS = [
@@ -55,6 +60,8 @@ REWARD_TERM_KEYS = [
     "reward_stop_overspeed",
     "reward_capture",
     "reward_moving_position",
+    "reward_moving_progress",
+    "reward_moving_recovery",
     "reward_moving_velocity",
     "reward_moving_good",
     "reward_stopped_position",
@@ -96,6 +103,9 @@ class LineFollowTaskConfig:
     moving_success_min_fraction: float = 0.50
     moving_success_xy_tolerance_m: float = 0.60
     moving_success_velocity_tolerance_mps: float = 0.35
+    vertical_motion_z_tolerance_m: float = 0.30
+    vertical_motion_velocity_tolerance_mps: float = 0.10
+    vertical_success_min_fraction: float = 0.75
     stopped_success_dwell_sec: float = 2.0
     capture_radius_m: float = 0.80
     capture_hold_sec: float = 1.0
@@ -104,6 +114,11 @@ class LineFollowTaskConfig:
     reward_capture_tracking_scale: float = 1.0
     reward_moving_good: float = 0.10
     reward_moving_joint_scale: float = 1.0
+    reward_moving_progress_scale: float = 0.0
+    moving_progress_clip_m: float = 0.10
+    reward_position_recovery_scale: float = 0.0
+    reward_velocity_correction_gain: float = 0.0
+    reward_velocity_correction_max_mps: float = 0.0
     max_tracking_error_m: float = 3.0
     min_target_distance_m: float = 0.35
     reward_position_scale: float = 2.0
@@ -118,6 +133,8 @@ class LineFollowTaskConfig:
     reward_too_close_scale: float = 1.5
     position_sigma_m: float = 0.75
     z_sigma_m: float = 0.50
+    position_recovery_sigma_m: float = 1.50
+    z_recovery_sigma_m: float = 0.80
     velocity_sigma_mps: float = 0.50
     stop_speed_sigma_mps: float = 0.30
     reward_action_delta_scale: float = 0.02
@@ -153,6 +170,7 @@ class FastLineFollowEnvConfig:
     reward_crash: float = -40.0
     reward_timeout: float = -30.0
     target_accel_observation_filter_alpha: float = 0.5
+    actor_mask_target_acceleration: bool = False
     action_limits: CTBRActionLimits = field(default_factory=CTBRActionLimits)
     safety_limits: SafetyLimits = field(default_factory=SafetyLimits)
     backend_config: RotorCTBRBackendConfig = field(default_factory=RotorCTBRBackendConfig)
@@ -183,6 +201,12 @@ class FastIrisLineFollowVecEnv:
         self._last_tracking_xy_err = np.full(self.num_envs, np.nan, dtype=np.float64)
         self._last_goal_xy_progress = np.zeros(self.num_envs, dtype=np.float64)
         self._last_velocity_error = np.zeros(self.num_envs, dtype=np.float64)
+        self._last_reward_velocity_error = np.zeros(
+            self.num_envs, dtype=np.float64
+        )
+        self._last_reward_velocity_correction_speed = np.zeros(
+            self.num_envs, dtype=np.float64
+        )
         self._last_speed_xy = np.full(self.num_envs, np.nan, dtype=np.float64)
         self._last_braking_progress = np.zeros(self.num_envs, dtype=np.float64)
         self._desired_approach_speed = np.zeros(self.num_envs, dtype=np.float64)
@@ -211,6 +235,19 @@ class FastIrisLineFollowVecEnv:
         self._moving_z_good = np.zeros(self.num_envs, dtype=bool)
         self._moving_velocity_good = np.zeros(self.num_envs, dtype=bool)
         self._moving_good = np.zeros(self.num_envs, dtype=bool)
+        self._last_vertical_velocity_error = np.zeros(self.num_envs, dtype=np.float64)
+        self._vertical_eligible_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._vertical_good_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._vertical_good_fraction = np.zeros(self.num_envs, dtype=np.float64)
+        self._vertical_position_good_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._vertical_velocity_good_steps = np.zeros(self.num_envs, dtype=np.int64)
+        self._vertical_position_good_fraction = np.zeros(self.num_envs, dtype=np.float64)
+        self._vertical_velocity_good_fraction = np.zeros(self.num_envs, dtype=np.float64)
+        self._vertical_motion_eligible = np.zeros(self.num_envs, dtype=bool)
+        self._vertical_position_good = np.zeros(self.num_envs, dtype=bool)
+        self._vertical_velocity_good = np.zeros(self.num_envs, dtype=bool)
+        self._vertical_good = np.zeros(self.num_envs, dtype=bool)
+        self._vertical_success_met = np.zeros(self.num_envs, dtype=bool)
         self._stopped_track_dwell_steps = np.zeros(self.num_envs, dtype=np.int64)
         self._stopped_eligible_steps = np.zeros(self.num_envs, dtype=np.int64)
         self._stopped_xy_good_steps = np.zeros(self.num_envs, dtype=np.int64)
@@ -361,6 +398,8 @@ class FastIrisLineFollowVecEnv:
         self._last_tracking_xy_err[env_id] = np.nan
         self._last_goal_xy_progress[env_id] = 0.0
         self._last_velocity_error[env_id] = 0.0
+        self._last_reward_velocity_error[env_id] = 0.0
+        self._last_reward_velocity_correction_speed[env_id] = 0.0
         self._last_speed_xy[env_id] = np.nan
         self._last_braking_progress[env_id] = 0.0
         self._desired_approach_speed[env_id] = 0.0
@@ -389,6 +428,19 @@ class FastIrisLineFollowVecEnv:
         self._moving_z_good[env_id] = False
         self._moving_velocity_good[env_id] = False
         self._moving_good[env_id] = False
+        self._last_vertical_velocity_error[env_id] = 0.0
+        self._vertical_eligible_steps[env_id] = 0
+        self._vertical_good_steps[env_id] = 0
+        self._vertical_good_fraction[env_id] = 0.0
+        self._vertical_position_good_steps[env_id] = 0
+        self._vertical_velocity_good_steps[env_id] = 0
+        self._vertical_position_good_fraction[env_id] = 0.0
+        self._vertical_velocity_good_fraction[env_id] = 0.0
+        self._vertical_motion_eligible[env_id] = False
+        self._vertical_position_good[env_id] = False
+        self._vertical_velocity_good[env_id] = False
+        self._vertical_good[env_id] = False
+        self._vertical_success_met[env_id] = False
         self._stopped_track_dwell_steps[env_id] = 0
         self._stopped_eligible_steps[env_id] = 0
         self._stopped_xy_good_steps[env_id] = 0
@@ -430,7 +482,7 @@ class FastIrisLineFollowVecEnv:
             max_offset = math.radians(max(0.0, min(180.0, self.config.random_yaw_max_offset_deg)))
             yaw_ned = float(self._rng.uniform(-max_offset, max_offset))
             self._policy_yaw_reference[env_id] = 0.0
-            self._yaw_target[env_id] = yaw_ned
+        self._yaw_target[env_id] = yaw_ned
 
         pos_enu = self.env_origins_enu[env_id] + ned_to_enu([0.0, 0.0, -self.config.takeoff_altitude])
         self._set_vehicle_pose_velocity(env_id, pos_enu, yaw_ned)
@@ -823,21 +875,27 @@ class FastIrisLineFollowVecEnv:
         x_err = float(obs.x) - goal.x
         y_err = float(obs.y) - goal.y
         z_err = float(obs.z) - goal.z
-        x_err, y_err = rotate_world_xy_to_policy_frame(x_err, y_err, obs.yaw, self._policy_yaw_reference[env_id])
-        vx, vy = rotate_world_xy_to_policy_frame(obs.vx, obs.vy, obs.yaw, self._policy_yaw_reference[env_id])
+        # The helper emits body-rate commands, so its world-frame tracking
+        # vectors must always be expressed in the current body heading.
+        x_err, y_err = rotate_world_xy_to_policy_frame(
+            x_err, y_err, obs.yaw, 0.0
+        )
+        vx, vy = rotate_world_xy_to_policy_frame(obs.vx, obs.vy, obs.yaw, 0.0)
         target_vx, target_vy = rotate_world_xy_to_policy_frame(
             self._goal_vel_ned[env_id, 0],
             self._goal_vel_ned[env_id, 1],
             obs.yaw,
-            self._policy_yaw_reference[env_id],
+            0.0,
         )
         target_ax, target_ay = rotate_world_xy_to_policy_frame(
             self._goal_accel_ned[env_id, 0],
             self._goal_accel_ned[env_id, 1],
             obs.yaw,
-            self._policy_yaw_reference[env_id],
+            0.0,
         )
         vz = float(obs.vz)
+        target_vz = float(self._goal_vel_ned[env_id, 2])
+        target_az = float(self._goal_accel_ned[env_id, 2])
 
         goal_feedback_scale = limits.goal_feedback_scale
         if goal_feedback_scale is None:
@@ -880,7 +938,10 @@ class FastIrisLineFollowVecEnv:
             )
 
         controller_thrust_delta = limits.z_feedback_scale * (
-            limits.z_pos_gain * z_err + limits.z_vel_gain * vz
+            limits.z_pos_gain * z_err
+            + limits.z_vel_gain * vz
+            - limits.z_target_velocity_gain * target_vz
+            - limits.z_target_accel_gain * target_az
         )
         policy_thrust_delta = pol_thrust - limits.hover_thrust
 
@@ -968,12 +1029,17 @@ class FastIrisLineFollowVecEnv:
     def _build_obs_one(self, env_id: int) -> np.ndarray:
         self._sync_goal_to_target(env_id)
         obs = self._obs_data(env_id)
+        actor_target_acceleration = (
+            np.zeros(3, dtype=np.float64)
+            if self.config.actor_mask_target_acceleration
+            else self._goal_accel_ned[env_id]
+        )
         policy_obs = observation_vector(
             own=obs,
             goal=self._goal[env_id],
             target_position=self._target_pos_ned[env_id],
             target_velocity=self._goal_vel_ned[env_id],
-            target_acceleration=self._goal_accel_ned[env_id],
+            target_acceleration=actor_target_acceleration,
             prev_command=self._prev_action[env_id],
             action_limits=self.config.action_limits,
             yaw_reference=self._policy_yaw_reference[env_id],
@@ -1162,6 +1228,7 @@ class FastIrisLineFollowVecEnv:
         xy_err = float(status["xy_err"])
         z_err = float(status["z_err"])
         vel_err_xy = float(status["vel_err_xy"])
+        vel_err_z = float(status["vel_err_z"])
         vel_err = float(status["vel_err"])
         speed_xy = float(status["speed_xy"])
         speed_z = float(status["speed_z"])
@@ -1178,10 +1245,15 @@ class FastIrisLineFollowVecEnv:
         self._moving_z_good[env_id] = False
         self._moving_velocity_good[env_id] = False
         self._moving_good[env_id] = False
+        self._vertical_motion_eligible[env_id] = False
+        self._vertical_position_good[env_id] = False
+        self._vertical_velocity_good[env_id] = False
+        self._vertical_good[env_id] = False
         self._stopped_xy_good[env_id] = False
         self._stopped_z_good[env_id] = False
         self._stopped_speed_good[env_id] = False
         self._last_velocity_error[env_id] = vel_err
+        self._last_vertical_velocity_error[env_id] = vel_err_z
         self._target_distance[env_id] = target_distance
         previous_speed_xy = (
             speed_xy
@@ -1193,7 +1265,7 @@ class FastIrisLineFollowVecEnv:
         self._last_braking_progress[env_id] = braking_progress
 
         prev_xy_err = xy_err if np.isnan(self._last_tracking_xy_err[env_id]) else self._last_tracking_xy_err[env_id]
-        goal_xy_progress = float(np.clip(prev_xy_err - xy_err, -0.5, 0.5))
+        goal_xy_progress = clipped_error_progress(prev_xy_err, xy_err, 0.5)
         self._last_tracking_xy_err[env_id] = xy_err
         self._last_goal_xy_progress[env_id] = goal_xy_progress
 
@@ -1301,6 +1373,48 @@ class FastIrisLineFollowVecEnv:
                     self._moving_good_fraction[env_id]
                     >= self.task_config.moving_success_min_fraction
                 )
+            self._vertical_motion_eligible[env_id] = bool(
+                moving_track_eligible
+                and str(self._primitive_id[env_id]) in ("climb", "descend")
+            )
+            if self._vertical_motion_eligible[env_id]:
+                self._vertical_position_good[env_id] = (
+                    z_err <= self.task_config.vertical_motion_z_tolerance_m
+                )
+                self._vertical_velocity_good[env_id] = (
+                    vel_err_z
+                    <= self.task_config.vertical_motion_velocity_tolerance_mps
+                )
+                self._vertical_good[env_id] = bool(
+                    self._vertical_position_good[env_id]
+                    and self._vertical_velocity_good[env_id]
+                )
+                self._vertical_eligible_steps[env_id] += 1
+                self._vertical_position_good_steps[env_id] += int(
+                    self._vertical_position_good[env_id]
+                )
+                self._vertical_velocity_good_steps[env_id] += int(
+                    self._vertical_velocity_good[env_id]
+                )
+                self._vertical_good_steps[env_id] += int(
+                    self._vertical_good[env_id]
+                )
+                vertical_denominator = float(
+                    max(1, self._vertical_eligible_steps[env_id])
+                )
+                self._vertical_position_good_fraction[env_id] = float(
+                    self._vertical_position_good_steps[env_id]
+                ) / vertical_denominator
+                self._vertical_velocity_good_fraction[env_id] = float(
+                    self._vertical_velocity_good_steps[env_id]
+                ) / vertical_denominator
+                self._vertical_good_fraction[env_id] = float(
+                    self._vertical_good_steps[env_id]
+                ) / vertical_denominator
+                self._vertical_success_met[env_id] = (
+                    self._vertical_good_fraction[env_id]
+                    >= self.task_config.vertical_success_min_fraction
+                )
             self._goal_dwell_steps[env_id] = self._moving_track_dwell_steps[env_id]
             self._goal_dwell_fraction[env_id] = min(
                 1.0,
@@ -1326,11 +1440,38 @@ class FastIrisLineFollowVecEnv:
         z_sigma = max(1e-3, float(self.task_config.z_sigma_m))
         vel_sigma = max(1e-3, float(self.task_config.velocity_sigma_mps))
         stop_sigma = max(1e-3, float(self.task_config.stop_speed_sigma_mps))
-        position_quality = math.exp(
-            -((xy_err / pos_sigma) ** 2)
-            -((z_err / z_sigma) ** 2)
+        position_quality, position_recovery_quality = position_reward_qualities(
+            xy_err,
+            z_err,
+            pos_sigma,
+            z_sigma,
+            self.task_config.position_recovery_sigma_m,
+            self.task_config.z_recovery_sigma_m,
         )
         velocity_quality = math.exp(-((vel_err / vel_sigma) ** 2))
+        position_error = np.array(
+            [goal.x - obs.x, goal.y - obs.y, goal.z - obs.z],
+            dtype=np.float64,
+        )
+        reward_velocity_reference, reward_velocity_correction_speed = (
+            corrective_velocity_reference(
+                self._goal_vel_ned[env_id],
+                position_error,
+                self.task_config.reward_velocity_correction_gain,
+                self.task_config.reward_velocity_correction_max_mps,
+            )
+        )
+        vehicle_velocity = np.array([obs.vx, obs.vy, obs.vz], dtype=np.float64)
+        reward_velocity_error = float(
+            np.linalg.norm(vehicle_velocity - reward_velocity_reference)
+        )
+        self._last_reward_velocity_error[env_id] = reward_velocity_error
+        self._last_reward_velocity_correction_speed[env_id] = (
+            reward_velocity_correction_speed
+        )
+        reward_velocity_quality = math.exp(
+            -((reward_velocity_error / vel_sigma) ** 2)
+        )
         dense_scale = (
             float(self.config.step_dt_sim_sec)
             if self.task_config.reward_scale_by_dt
@@ -1347,10 +1488,15 @@ class FastIrisLineFollowVecEnv:
             and not capture_acquired_now
             and not target_stopped
         )
+        vertical_requirement_met = bool(
+            self._vertical_eligible_steps[env_id] == 0
+            or self._vertical_success_met[env_id]
+        )
         stopped_reward_active = (
             self._capture_acquired[env_id]
             and target_stopped
             and self._moving_success_met[env_id]
+            and vertical_requirement_met
         )
         reward_alive = dense_scale * self.config.reward_alive
         reward_time = (
@@ -1376,13 +1522,30 @@ class FastIrisLineFollowVecEnv:
             if moving_reward_active
             else 0.0
         )
+        moving_xy_progress = clipped_error_progress(
+            prev_xy_err,
+            xy_err,
+            self.task_config.moving_progress_clip_m,
+        )
+        reward_moving_progress = (
+            self.task_config.reward_moving_progress_scale * moving_xy_progress
+            if moving_reward_active
+            else 0.0
+        )
+        reward_moving_recovery = (
+            dense_scale
+            * self.task_config.reward_position_recovery_scale
+            * position_recovery_quality
+            if moving_reward_active
+            else 0.0
+        )
         reward_moving_velocity = (
             dense_scale
             * (
-                self.task_config.reward_velocity_scale * velocity_quality
+                self.task_config.reward_velocity_scale * reward_velocity_quality
                 + self.task_config.reward_moving_joint_scale
                 * position_quality
-                * velocity_quality
+                * reward_velocity_quality
             )
             if moving_reward_active
             else 0.0
@@ -1505,9 +1668,22 @@ class FastIrisLineFollowVecEnv:
 
         if (
             not done
+            and target_stopped
+            and self._capture_acquired[env_id]
+            and self._moving_success_met[env_id]
+            and self._vertical_eligible_steps[env_id] > 0
+            and not self._vertical_success_met[env_id]
+        ):
+            done = True
+            done_reason = "vertical_success_failed"
+            reward_timeout = self.config.reward_timeout
+
+        if (
+            not done
             and bool(status["target_stopped"])
             and self._capture_acquired[env_id]
             and self._moving_success_met[env_id]
+            and vertical_requirement_met
             and self._stopped_track_dwell_steps[env_id] >= self.required_stopped_track_steps
         ):
             done = True
@@ -1529,6 +1705,8 @@ class FastIrisLineFollowVecEnv:
             + reward_stop_overspeed
             + reward_capture
             + reward_moving_position
+            + reward_moving_progress
+            + reward_moving_recovery
             + reward_moving_velocity
             + reward_moving_good
             + reward_stopped_position
@@ -1551,6 +1729,8 @@ class FastIrisLineFollowVecEnv:
             "reward_stop_overspeed": float(reward_stop_overspeed),
             "reward_capture": float(reward_capture),
             "reward_moving_position": float(reward_moving_position),
+            "reward_moving_progress": float(reward_moving_progress),
+            "reward_moving_recovery": float(reward_moving_recovery),
             "reward_moving_velocity": float(reward_moving_velocity),
             "reward_moving_good": float(reward_moving_good),
             "reward_stopped_position": float(reward_stopped_position),
@@ -1682,6 +1862,9 @@ class FastIrisLineFollowVecEnv:
             "goal_ref_accel_x": float(self._goal_accel_ned[env_id, 0]),
             "goal_ref_accel_y": float(self._goal_accel_ned[env_id, 1]),
             "goal_ref_accel_z": float(self._goal_accel_ned[env_id, 2]),
+            "actor_target_acceleration_masked": bool(
+                self.config.actor_mask_target_acceleration
+            ),
             "target_heading_rad": float(self._target_heading_rad[env_id]),
             "target_curvature_per_m": float(self._target_curvature_per_m[env_id]),
             "observed_target_accel_x": float(self._observed_target_accel_ned[env_id, 0]),
@@ -1692,6 +1875,15 @@ class FastIrisLineFollowVecEnv:
             "target_z": float(self._target_pos_ned[env_id, 2]),
             "target_distance": float(self._target_distance[env_id]),
             "tracking_velocity_error": float(self._last_velocity_error[env_id]),
+            "reward_velocity_error": float(
+                self._last_reward_velocity_error[env_id]
+            ),
+            "reward_velocity_correction_speed": float(
+                self._last_reward_velocity_correction_speed[env_id]
+            ),
+            "vertical_velocity_error": float(
+                self._last_vertical_velocity_error[env_id]
+            ),
             "braking_progress": float(self._last_braking_progress[env_id]),
             "target_stopped": bool(self._target_is_stopped(env_id)),
             "desired_approach_speed": float(self._desired_approach_speed[env_id]),
@@ -1755,6 +1947,43 @@ class FastIrisLineFollowVecEnv:
             "moving_success_xy_tolerance_m": float(self.task_config.moving_success_xy_tolerance_m),
             "moving_success_velocity_tolerance_mps": float(
                 self.task_config.moving_success_velocity_tolerance_mps
+            ),
+            "vertical_motion_eligible": bool(
+                self._vertical_motion_eligible[env_id]
+            ),
+            "vertical_success_met": bool(self._vertical_success_met[env_id]),
+            "vertical_position_good": bool(
+                self._vertical_position_good[env_id]
+            ),
+            "vertical_velocity_good": bool(
+                self._vertical_velocity_good[env_id]
+            ),
+            "vertical_good": bool(self._vertical_good[env_id]),
+            "vertical_eligible_steps": int(self._vertical_eligible_steps[env_id]),
+            "vertical_position_good_steps": int(
+                self._vertical_position_good_steps[env_id]
+            ),
+            "vertical_velocity_good_steps": int(
+                self._vertical_velocity_good_steps[env_id]
+            ),
+            "vertical_good_steps": int(self._vertical_good_steps[env_id]),
+            "vertical_position_good_fraction": float(
+                self._vertical_position_good_fraction[env_id]
+            ),
+            "vertical_velocity_good_fraction": float(
+                self._vertical_velocity_good_fraction[env_id]
+            ),
+            "vertical_good_fraction": float(
+                self._vertical_good_fraction[env_id]
+            ),
+            "vertical_motion_z_tolerance_m": float(
+                self.task_config.vertical_motion_z_tolerance_m
+            ),
+            "vertical_motion_velocity_tolerance_mps": float(
+                self.task_config.vertical_motion_velocity_tolerance_mps
+            ),
+            "vertical_success_min_fraction": float(
+                self.task_config.vertical_success_min_fraction
             ),
             "stopped_track_dwell_steps": int(self._stopped_track_dwell_steps[env_id]),
             "required_stopped_track_steps": int(self.required_stopped_track_steps),

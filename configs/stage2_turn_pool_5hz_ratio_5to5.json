@@ -192,7 +192,7 @@
     "reward_scale_by_dt": true
   },
   "output": {
-    "results_root": "../result/ppo_Motion_pool_turn_ratio_5to5",
+    "results_root": "../result/ppo_train",
     "live_plot_interval": 2,
     "no_tensorboard": false,
     "no_terminal_log": false

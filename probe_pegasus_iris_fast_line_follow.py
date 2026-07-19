@@ -77,6 +77,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--z_feedback_scale", type=float, default=1.0)
     parser.add_argument("--z_pos_gain", type=float, default=0.04)
     parser.add_argument("--z_vel_gain", type=float, default=0.06)
+    parser.add_argument("--z_target_velocity_gain", type=float, default=0.0)
+    parser.add_argument("--z_target_accel_gain", type=float, default=0.0)
     parser.add_argument("--safety_max_xy_from_home", type=float, default=5.5)
 
     parser.add_argument("--mass_kg", type=float, default=1.52)
@@ -165,6 +167,11 @@ def parse_args() -> argparse.Namespace:
         "max_roll_rate",
         "max_pitch_rate",
         "max_yaw_rate",
+        "z_feedback_scale",
+        "z_pos_gain",
+        "z_vel_gain",
+        "z_target_velocity_gain",
+        "z_target_accel_gain",
     ):
         if getattr(args, name) < 0.0:
             parser.error(f"--{name} must be non-negative")
@@ -253,6 +260,11 @@ def default_payload(args: argparse.Namespace) -> Dict[str, object]:
             "attitude_feedback_scale": args.attitude_feedback_scale,
             "rate_kp": [args.rate_kp_roll, args.rate_kp_pitch, args.rate_kp_yaw],
             "motor_time_constant": args.motor_time_constant,
+            "z_feedback_scale": args.z_feedback_scale,
+            "z_pos_gain": args.z_pos_gain,
+            "z_vel_gain": args.z_vel_gain,
+            "z_target_velocity_gain": args.z_target_velocity_gain,
+            "z_target_accel_gain": args.z_target_accel_gain,
         },
         "probe_metrics": {
             "hover": ["xy_rms_m", "z_rms_m", "speed_rms_mps", "max_tilt_deg"],
@@ -345,6 +357,8 @@ def make_configs(args):
         z_feedback_scale=args.z_feedback_scale,
         z_pos_gain=args.z_pos_gain,
         z_vel_gain=args.z_vel_gain,
+        z_target_velocity_gain=args.z_target_velocity_gain,
+        z_target_accel_gain=args.z_target_accel_gain,
     )
     max_requested_line_length = (
         args.line_length_max_m

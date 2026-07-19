@@ -110,6 +110,7 @@ class MotionPoolConfig:
     primitive_ids: Tuple[str, ...]
     prefix_ids: Tuple[str, ...]
     required_ids: Tuple[str, ...]
+    required_one_of_ids: Tuple[str, ...]
     prevent_consecutive_same: bool
     stop_hold_sec: float
     reference_horizon_sec: Tuple[float, ...]
@@ -126,6 +127,7 @@ class MotionPoolConfig:
             primitive_ids=(),
             prefix_ids=(),
             required_ids=(),
+            required_one_of_ids=(),
             prevent_consecutive_same=True,
             stop_hold_sec=2.0,
             reference_horizon_sec=(),
@@ -148,23 +150,52 @@ class MotionPoolConfig:
         primitive_ids = tuple(str(value) for value in data.get("primitive_ids", ()))
         prefix_ids = tuple(str(value) for value in data.get("prefix_ids", ()))
         required_ids = tuple(str(value) for value in data.get("required_ids", ()))
+        required_one_of_ids = tuple(
+            str(value) for value in data.get("required_one_of_ids", ())
+        )
         if not primitive_ids and not prefix_ids:
             raise ValueError("motion_pool must contain primitive_ids or prefix_ids")
         missing = [
             value
-            for value in (*primitive_ids, *prefix_ids, *required_ids)
+            for value in (
+                *primitive_ids,
+                *prefix_ids,
+                *required_ids,
+                *required_one_of_ids,
+            )
             if value not in templates
         ]
         if missing:
             raise ValueError(f"motion_pool references undefined primitive ids: {sorted(set(missing))}")
         if primitive_ids and sum(templates[value].weight for value in primitive_ids) <= 0.0:
             raise ValueError("at least one selectable primitive must have positive weight")
+        if required_one_of_ids and sum(
+            templates[value].weight for value in required_one_of_ids
+        ) <= 0.0:
+            raise ValueError(
+                "motion_pool.required_one_of_ids must contain a positive-weight primitive"
+            )
+        if len(set(required_ids)) != len(required_ids):
+            raise ValueError("motion_pool.required_ids must not contain duplicates")
+        if len(set(required_one_of_ids)) != len(required_one_of_ids):
+            raise ValueError(
+                "motion_pool.required_one_of_ids must not contain duplicates"
+            )
+        overlap = sorted(set(required_ids).intersection(required_one_of_ids))
+        if overlap:
+            raise ValueError(
+                "motion_pool.required_ids and required_one_of_ids must be disjoint; "
+                f"overlap={overlap}"
+            )
         min_segments = int(data.get("min_segments", 2))
         max_segments = int(data.get("max_segments", min_segments))
         if min_segments < 0 or max_segments < min_segments:
             raise ValueError("motion_pool segment limits are invalid")
-        if len(required_ids) > min_segments:
-            raise ValueError("motion_pool.required_ids cannot exceed min_segments")
+        required_slots = len(required_ids) + int(bool(required_one_of_ids))
+        if required_slots > min_segments:
+            raise ValueError(
+                "motion_pool required primitives cannot exceed min_segments"
+            )
         reference_horizon = tuple(float(value) for value in data.get("reference_horizon_sec", ()))
         if any(value <= 0.0 for value in reference_horizon):
             raise ValueError("reference_horizon_sec entries must be positive")
@@ -188,6 +219,7 @@ class MotionPoolConfig:
             primitive_ids=primitive_ids,
             prefix_ids=prefix_ids,
             required_ids=required_ids,
+            required_one_of_ids=required_one_of_ids,
             prevent_consecutive_same=prevent_consecutive_same,
             stop_hold_sec=stop_hold_sec,
             reference_horizon_sec=reference_horizon,
@@ -313,6 +345,23 @@ class MotionTaskGenerator:
             attempts = max(16, self.config.max_resample_attempts)
             for _ in range(attempts):
                 sampled = list(self.config.required_ids)
+                if self.config.required_one_of_ids:
+                    required_weights = np.asarray(
+                        [
+                            self.config.templates[value].weight
+                            for value in self.config.required_one_of_ids
+                        ],
+                        dtype=np.float64,
+                    )
+                    required_weights /= required_weights.sum()
+                    sampled.append(
+                        str(
+                            rng.choice(
+                                self.config.required_one_of_ids,
+                                p=required_weights,
+                            )
+                        )
+                    )
                 sampled.extend(
                     str(rng.choice(self.config.primitive_ids, p=weights))
                     for _ in range(count - len(sampled))

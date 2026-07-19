@@ -66,6 +66,104 @@ class MotionTaskGeneratorTest(unittest.TestCase):
             )
             self.assertGreater(float(turn_curvature.max()), 0.01)
 
+    def test_vertical_stage_requires_bounded_climb_or_descent(self) -> None:
+        config = self._load_pool("stage3_vertical_pool_5hz_ratio_5to5.json")
+        generator = MotionTaskGenerator(config, dt=0.2, follow_distance_m=1.0)
+        rng = np.random.default_rng(19)
+        sampled_directions = set()
+        for _ in range(64):
+            trajectory = generator.sample(
+                rng,
+                [0.0, 0.0, -5.0],
+                rng.uniform(-np.pi, np.pi),
+            )
+            vertical_sequence = [
+                primitive_id
+                for primitive_id in trajectory.sequence_ids
+                if primitive_id in {"climb", "descend"}
+            ]
+            self.assertEqual(len(vertical_sequence), 1)
+            vertical_ids = set(vertical_sequence)
+            sampled_directions.update(vertical_ids)
+            self.assertNotIn("turn", trajectory.sequence_ids)
+            self.assertLessEqual(
+                float(np.max(np.abs(trajectory.positions[:, 2] + 5.0))),
+                config.limits.max_vertical_displacement_m + 1e-6,
+            )
+            primitive_ids = np.asarray(trajectory.primitive_ids, dtype=object)
+            if "climb" in vertical_ids:
+                climb_velocity = trajectory.velocities[primitive_ids == "climb", 2]
+                self.assertLess(float(np.min(climb_velocity)), -0.03)
+            if "descend" in vertical_ids:
+                descend_velocity = trajectory.velocities[primitive_ids == "descend", 2]
+                self.assertGreater(float(np.max(descend_velocity)), 0.03)
+            self.assertTrue(np.allclose(trajectory.velocities[-1], 0.0))
+            self.assertEqual(trajectory.phases[-1], "stopped")
+        self.assertEqual(sampled_directions, {"climb", "descend"})
+
+    def test_combined_long_stage_covers_all_curriculum_families(self) -> None:
+        config_data = json.loads(
+            (PACKAGE_DIR / "configs" / "stage4_combined_long_pool_5hz_ratio_5to5.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        config = MotionPoolConfig.from_dict(config_data["task"]["motion_pool"])
+        generator = MotionTaskGenerator(config, dt=0.2, follow_distance_m=1.0)
+        rng = np.random.default_rng(1)
+        sampled_lengths = set()
+        sampled_primitives = set()
+        for _ in range(64):
+            trajectory = generator.sample(
+                rng,
+                [0.0, 0.0, -5.0],
+                rng.uniform(-np.pi, np.pi),
+            )
+            sampled_lengths.add(len(trajectory.sequence_ids))
+            sampled_primitives.update(trajectory.sequence_ids)
+            self.assertEqual(trajectory.sequence_ids[0], "accelerate")
+            self.assertIn("turn", trajectory.sequence_ids)
+            self.assertTrue(
+                {"climb", "descend"}.intersection(trajectory.sequence_ids)
+            )
+            self.assertLessEqual(
+                trajectory.duration_sec,
+                config_data["training"]["episode_length"]
+                * config_data["environment"]["step_dt_sim_sec"],
+            )
+            self.assertLessEqual(
+                float(np.linalg.norm(trajectory.positions[:, :2], axis=1).max()),
+                config.limits.max_horizontal_radius_m + 1e-6,
+            )
+        self.assertEqual(sampled_lengths, {7, 8, 9})
+        self.assertEqual(
+            sampled_primitives,
+            {"accelerate", "cruise", "decelerate", "turn", "climb", "descend"},
+        )
+
+    def test_extra_long_stage_samples_requested_segment_counts(self) -> None:
+        config_data = json.loads(
+            (PACKAGE_DIR / "configs" / "stage5_combined_extra_long_pool_400k_seed2.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        config = MotionPoolConfig.from_dict(config_data["task"]["motion_pool"])
+        generator = MotionTaskGenerator(config, dt=0.2, follow_distance_m=1.0)
+        rng = np.random.default_rng(2)
+        sampled_lengths = set()
+        for _ in range(48):
+            trajectory = generator.sample(
+                rng,
+                [0.0, 0.0, -5.0],
+                rng.uniform(-np.pi, np.pi),
+            )
+            sampled_lengths.add(len(trajectory.sequence_ids))
+            self.assertLessEqual(
+                trajectory.duration_sec,
+                config_data["training"]["episode_length"]
+                * config_data["environment"]["step_dt_sim_sec"],
+            )
+        self.assertEqual(sampled_lengths, {11, 12, 13})
+
 
 if __name__ == "__main__":
     unittest.main()
