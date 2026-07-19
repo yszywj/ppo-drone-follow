@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import copy
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -9,6 +10,7 @@ import torch
 
 from pegasus_iris_fast_line_follow.ppo_core import (
     ActorCritic,
+    PopArtValueNormalizer,
     load_transplanted_checkpoint,
     restore_training_state,
     save_policy_checkpoint,
@@ -77,6 +79,9 @@ class RecurrentActorCriticTest(unittest.TestCase):
     def test_checkpoint_round_trip_restores_optimizers(self) -> None:
         actor_optimizer = torch.optim.Adam(list(self.policy.actor_parameters()), lr=1e-4)
         critic_optimizer = torch.optim.Adam(list(self.policy.critic_parameters()), lr=2e-4)
+        reference_policy = copy.deepcopy(self.policy)
+        with torch.no_grad():
+            reference_policy.actor_mean.bias.add_(0.25)
         actor_optimizer.zero_grad()
         self.policy.log_std.square().sum().backward()
         actor_optimizer.step()
@@ -91,6 +96,7 @@ class RecurrentActorCriticTest(unittest.TestCase):
                 actor_optimizer=actor_optimizer,
                 critic_optimizer=critic_optimizer,
                 env_rng=rng,
+                reference_policy=reference_policy,
             )
             restored = ActorCritic(
                 obs_dim=32,
@@ -122,7 +128,13 @@ class RecurrentActorCriticTest(unittest.TestCase):
                     env_rng=np.random.default_rng(),
                 )
             )
-            self.assertEqual(payload["format_version"], 3)
+            self.assertEqual(payload["format_version"], 5)
+            self.assertTrue(
+                torch.allclose(
+                    payload["reference_policy_state_dict"]["actor_mean.bias"],
+                    reference_policy.actor_mean.bias,
+                )
+            )
             self.assertTrue(
                 torch.allclose(self.policy.log_std, restored.log_std)
             )
@@ -208,6 +220,74 @@ class RecurrentActorCriticTest(unittest.TestCase):
                 )
             )
             torch.cuda.set_rng_state_all(payload["torch_cuda_random_state"])
+
+    def test_distribution_sequence_reference_kl(self) -> None:
+        obs = torch.randn(6, 3, 32)
+        episode_starts = torch.zeros(6, 3)
+        episode_starts[0] = 1.0
+        reference = copy.deepcopy(self.policy)
+        mean, std, _ = self.policy.distribution_parameters_sequence(
+            obs,
+            self.policy.initial_state(3),
+            episode_starts,
+        )
+        reference_mean, reference_std, _ = (
+            reference.distribution_parameters_sequence(
+                obs,
+                reference.initial_state(3),
+                episode_starts,
+            )
+        )
+        same_kl = (
+            torch.log(reference_std / std)
+            + (std.square() + (mean - reference_mean).square())
+            / (2.0 * reference_std.square())
+            - 0.5
+        ).sum(dim=-1).mean()
+        self.assertAlmostEqual(float(same_kl), 0.0, places=7)
+        with torch.no_grad():
+            self.policy.actor_mean.bias.add_(0.1)
+        shifted_mean, shifted_std, _ = (
+            self.policy.distribution_parameters_sequence(
+                obs,
+                self.policy.initial_state(3),
+                episode_starts,
+            )
+        )
+        shifted_kl = (
+            torch.log(reference_std / shifted_std)
+            + (
+                shifted_std.square()
+                + (shifted_mean - reference_mean).square()
+            )
+            / (2.0 * reference_std.square())
+            - 0.5
+        ).sum(dim=-1).mean()
+        self.assertGreater(float(shifted_kl), 0.0)
+
+
+class PopArtValueNormalizerTest(unittest.TestCase):
+    def test_update_preserves_denormalized_value_predictions(self) -> None:
+        torch.manual_seed(11)
+        policy = ActorCritic(
+            obs_dim=8,
+            action_dim=2,
+            critic_obs_dim=12,
+            actor_hidden_sizes=(16, 8),
+            critic_hidden_sizes=(16, 8),
+            recurrent_hidden_size=8,
+        )
+        normalizer = PopArtValueNormalizer(torch.device("cpu"), beta=0.9)
+        optimizer = torch.optim.Adam(policy.critic_parameters(), lr=1e-3)
+        critic_obs = torch.randn(32, 12)
+        raw_before = normalizer.denormalize(policy.value(critic_obs)).detach()
+        returns = 20.0 + 7.0 * torch.randn(128)
+        normalizer.update(returns, policy.critic, optimizer=optimizer)
+        raw_after = normalizer.denormalize(policy.value(critic_obs)).detach()
+        self.assertTrue(torch.allclose(raw_before, raw_after, atol=2e-5))
+        normalized_returns = normalizer.normalize(returns)
+        self.assertAlmostEqual(float(normalized_returns.mean()), 0.0, places=5)
+        self.assertAlmostEqual(float(normalized_returns.std(unbiased=False)), 1.0, places=5)
 
 
 if __name__ == "__main__":

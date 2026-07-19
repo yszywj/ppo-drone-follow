@@ -47,6 +47,11 @@ from .reward_shaping import (
     corrective_velocity_reference,
     position_reward_qualities,
 )
+from .tracking_window import (
+    TrackingQualityWindow,
+    seconds_to_steps,
+    tracking_event_rewards,
+)
 
 
 REWARD_TERM_KEYS = [
@@ -64,6 +69,8 @@ REWARD_TERM_KEYS = [
     "reward_moving_recovery",
     "reward_moving_velocity",
     "reward_moving_good",
+    "reward_local_tracking",
+    "reward_local_drift",
     "reward_stopped_position",
     "reward_tilt",
     "reward_control",
@@ -119,6 +126,13 @@ class LineFollowTaskConfig:
     reward_position_recovery_scale: float = 0.0
     reward_velocity_correction_gain: float = 0.0
     reward_velocity_correction_max_mps: float = 0.0
+    local_tracking_window_sec: float = 2.0
+    local_tracking_reward_interval_sec: float = 2.0
+    local_tracking_velocity_tolerance_mps: float = 0.25
+    local_tracking_hard_fraction_weight: float = 0.30
+    local_tracking_drift_deadband_m: float = 0.05
+    reward_local_tracking_scale: float = 0.0
+    reward_local_drift_scale: float = 0.0
     max_tracking_error_m: float = 3.0
     min_target_distance_m: float = 0.35
     reward_position_scale: float = 2.0
@@ -154,6 +168,7 @@ class FastLineFollowEnvConfig:
     takeoff_altitude: float = 5.0
     render: bool = False
     seed: int = 43
+    independent_env_rng: bool = False
     randomize_yaw_on_reset: bool = False
     random_yaw_max_offset_deg: float = 180.0
     yaw_hold_kp: float = 1.0
@@ -189,12 +204,62 @@ class FastIrisLineFollowVecEnv:
         self.reference_horizon_sec = tuple(task_config.motion_pool.reference_horizon_sec)
         self.future_reference_dim = 3 * len(self.reference_horizon_sec)
         self.obs_dim = self.base_obs_dim
-        self.privileged_obs_dim = 4 + len(PRIMITIVE_CODES) + 16
+        self.local_tracking_privileged_dim = 6
+        self.privileged_obs_dim = (
+            4
+            + len(PRIMITIVE_CODES)
+            + 16
+            + self.local_tracking_privileged_dim
+        )
         self.critic_obs_dim = (
             self.obs_dim + self.future_reference_dim + self.privileged_obs_dim
         )
         self._rng = np.random.default_rng(config.seed)
+        self._env_rngs = [
+            np.random.default_rng(np.random.SeedSequence([config.seed, env_id]))
+            for env_id in range(self.num_envs)
+        ]
         self._sim_steps_per_policy_step = max(1, int(round(config.step_dt_sim_sec / config.physics_dt)))
+        local_window_steps = seconds_to_steps(
+            task_config.local_tracking_window_sec,
+            config.step_dt_sim_sec,
+        )
+        local_interval_steps = seconds_to_steps(
+            task_config.local_tracking_reward_interval_sec,
+            config.step_dt_sim_sec,
+        )
+        self._tracking_quality_windows = [
+            TrackingQualityWindow(
+                window_steps=local_window_steps,
+                interval_steps=local_interval_steps,
+                xy_tolerance_m=task_config.moving_success_xy_tolerance_m,
+                velocity_tolerance_mps=(
+                    task_config.local_tracking_velocity_tolerance_mps
+                ),
+                z_tolerance_m=task_config.tracking_z_tolerance_m,
+                xy_sigma_m=task_config.position_sigma_m,
+                velocity_sigma_mps=task_config.velocity_sigma_mps,
+                z_sigma_m=task_config.z_sigma_m,
+            )
+            for _ in range(self.num_envs)
+        ]
+        self._local_window_ready = np.zeros(self.num_envs, dtype=bool)
+        self._local_window_event = np.zeros(self.num_envs, dtype=bool)
+        self._local_soft_joint_quality = np.zeros(
+            self.num_envs, dtype=np.float64
+        )
+        self._local_xy_good_fraction = np.zeros(
+            self.num_envs, dtype=np.float64
+        )
+        self._local_velocity_good_fraction = np.zeros(
+            self.num_envs, dtype=np.float64
+        )
+        self._local_z_good_fraction = np.zeros(
+            self.num_envs, dtype=np.float64
+        )
+        self._local_xy_drift_delta_m = np.zeros(
+            self.num_envs, dtype=np.float64
+        )
         self._episode_id = np.zeros(self.num_envs, dtype=np.int64)
         self._step_id = np.zeros(self.num_envs, dtype=np.int64)
         self._episode_return = np.zeros(self.num_envs, dtype=np.float64)
@@ -307,6 +372,18 @@ class FastIrisLineFollowVecEnv:
             (self.num_envs, 1),
         )
         self._previous_policy_action = np.zeros((self.num_envs, self.action_dim), dtype=np.float32)
+        self._last_policy_command = np.tile(
+            np.array(
+                [0.0, 0.0, 0.0, config.action_limits.hover_thrust],
+                dtype=np.float32,
+            ),
+            (self.num_envs, 1),
+        )
+        self._last_controller_command = self._last_policy_command.copy()
+        self._last_unclipped_command = self._last_policy_command.copy()
+        self._last_command_saturated = np.zeros(
+            (self.num_envs, self.action_dim), dtype=bool
+        )
         self._motion_generator = (
             MotionTaskGenerator(
                 task_config.motion_pool,
@@ -428,6 +505,14 @@ class FastIrisLineFollowVecEnv:
         self._moving_z_good[env_id] = False
         self._moving_velocity_good[env_id] = False
         self._moving_good[env_id] = False
+        self._tracking_quality_windows[env_id].reset()
+        self._local_window_ready[env_id] = False
+        self._local_window_event[env_id] = False
+        self._local_soft_joint_quality[env_id] = 0.0
+        self._local_xy_good_fraction[env_id] = 0.0
+        self._local_velocity_good_fraction[env_id] = 0.0
+        self._local_z_good_fraction[env_id] = 0.0
+        self._local_xy_drift_delta_m[env_id] = 0.0
         self._last_vertical_velocity_error[env_id] = 0.0
         self._vertical_eligible_steps[env_id] = 0
         self._vertical_good_steps[env_id] = 0
@@ -465,6 +550,14 @@ class FastIrisLineFollowVecEnv:
             self.config.action_limits.hover_thrust,
         ]
         self._previous_policy_action[env_id, :] = 0.0
+        safe_command = np.array(
+            [0.0, 0.0, 0.0, self.config.action_limits.hover_thrust],
+            dtype=np.float32,
+        )
+        self._last_policy_command[env_id, :] = safe_command
+        self._last_controller_command[env_id, :] = safe_command
+        self._last_unclipped_command[env_id, :] = safe_command
+        self._last_command_saturated[env_id, :] = False
         self._primitive_id[env_id] = "capture"
         self._primitive_code[env_id] = PRIMITIVE_CODES["capture"]
         self._primitive_segment_index[env_id] = 0
@@ -480,7 +573,7 @@ class FastIrisLineFollowVecEnv:
         self._yaw_target[env_id] = None
         if self.config.randomize_yaw_on_reset:
             max_offset = math.radians(max(0.0, min(180.0, self.config.random_yaw_max_offset_deg)))
-            yaw_ned = float(self._rng.uniform(-max_offset, max_offset))
+            yaw_ned = float(self._rng_for_env(env_id).uniform(-max_offset, max_offset))
             self._policy_yaw_reference[env_id] = 0.0
         self._yaw_target[env_id] = yaw_ned
 
@@ -521,10 +614,16 @@ class FastIrisLineFollowVecEnv:
         dc.set_rigid_body_linear_velocity(body, carb._carb.Float3([0.0, 0.0, 0.0]))
         dc.set_rigid_body_angular_velocity(body, carb._carb.Float3([0.0, 0.0, 0.0]))
 
+    def _rng_for_env(self, env_id: int) -> np.random.Generator:
+        if self.config.independent_env_rng:
+            return self._env_rngs[env_id]
+        return self._rng
+
     def _sample_line_goal(self, env_id: int) -> None:
         task = self.task_config
+        rng = self._rng_for_env(env_id)
         yaw_deg = (
-            self._rng.uniform(task.line_yaw_min_deg, task.line_yaw_max_deg)
+            rng.uniform(task.line_yaw_min_deg, task.line_yaw_max_deg)
             if task.randomize_line_yaw
             else task.line_yaw_deg
         )
@@ -534,13 +633,13 @@ class FastIrisLineFollowVecEnv:
             min_length = max(0.0, float(task.line_length_min_m))
             max_length = max(min_length, float(task.line_length_max_m))
             if task.line_length_sampling == "uniform_area":
-                squared_length = self._rng.uniform(
+                squared_length = rng.uniform(
                     min_length * min_length,
                     max_length * max_length,
                 )
                 line_length = math.sqrt(float(squared_length))
             elif task.line_length_sampling == "uniform_radius":
-                line_length = float(self._rng.uniform(min_length, max_length))
+                line_length = float(rng.uniform(min_length, max_length))
             else:
                 raise ValueError(
                     "line_length_sampling must be 'uniform_area' or "
@@ -560,8 +659,9 @@ class FastIrisLineFollowVecEnv:
 
     def _sample_motion_task(self, env_id: int) -> None:
         task = self.task_config
+        rng = self._rng_for_env(env_id)
         yaw_deg = (
-            self._rng.uniform(task.line_yaw_min_deg, task.line_yaw_max_deg)
+            rng.uniform(task.line_yaw_min_deg, task.line_yaw_max_deg)
             if task.randomize_line_yaw
             else task.line_yaw_deg
         )
@@ -569,7 +669,7 @@ class FastIrisLineFollowVecEnv:
         self._line_dir[env_id] = [math.cos(yaw), math.sin(yaw)]
         home = self._home[env_id]
         trajectory = self._motion_generator.sample(
-            self._rng,
+            rng,
             [home.x, home.y, home.z + task.target_z_delta_m],
             yaw,
         )
@@ -811,18 +911,24 @@ class FastIrisLineFollowVecEnv:
 
     @property
     def required_capture_steps(self) -> int:
-        sec = max(0.0, float(self.task_config.capture_hold_sec))
-        return max(1, int(math.ceil(sec / self.config.step_dt_sim_sec))) if sec > 0.0 else 1
+        return seconds_to_steps(
+            self.task_config.capture_hold_sec,
+            self.config.step_dt_sim_sec,
+        )
 
     @property
     def required_moving_track_steps(self) -> int:
-        sec = max(0.0, float(self.task_config.moving_success_dwell_sec))
-        return max(1, int(math.ceil(sec / self.config.step_dt_sim_sec))) if sec > 0.0 else 1
+        return seconds_to_steps(
+            self.task_config.moving_success_dwell_sec,
+            self.config.step_dt_sim_sec,
+        )
 
     @property
     def required_stopped_track_steps(self) -> int:
-        sec = max(0.0, float(self.task_config.stopped_success_dwell_sec))
-        return max(1, int(math.ceil(sec / self.config.step_dt_sim_sec))) if sec > 0.0 else 1
+        return seconds_to_steps(
+            self.task_config.stopped_success_dwell_sec,
+            self.config.step_dt_sim_sec,
+        )
 
     def step(self, actions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Dict[str, Any]]]:
         actions = np.asarray(actions, dtype=np.float32)
@@ -944,6 +1050,9 @@ class FastIrisLineFollowVecEnv:
             - limits.z_target_accel_gain * target_az
         )
         policy_thrust_delta = pol_thrust - limits.hover_thrust
+        policy_command = np.array(
+            [pol_roll, pol_pitch, pol_yaw, pol_thrust], dtype=np.float32
+        )
 
         if limits.control_mix_mode == "ratio":
             policy_ratio = clamp(limits.policy_ratio, 0.0, 1.0)
@@ -963,6 +1072,15 @@ class FastIrisLineFollowVecEnv:
                 limits.thrust_min,
                 limits.thrust_max,
             )
+            controller_command = np.array(
+                [
+                    controller_roll,
+                    controller_pitch,
+                    controller_yaw,
+                    controller_thrust,
+                ],
+                dtype=np.float32,
+            )
             roll = controller_ratio * controller_roll + policy_ratio * pol_roll
             pitch = controller_ratio * controller_pitch + policy_ratio * pol_pitch
             yaw = controller_ratio * controller_yaw + policy_ratio * pol_yaw
@@ -977,11 +1095,31 @@ class FastIrisLineFollowVecEnv:
                 + controller_thrust_delta
                 + limits.residual_gain * policy_thrust_delta
             )
+            controller_command = np.array(
+                [
+                    controller_roll_raw,
+                    controller_pitch_raw,
+                    controller_yaw,
+                    limits.hover_thrust + controller_thrust_delta,
+                ],
+                dtype=np.float32,
+            )
 
+        unclipped_command = np.array([roll, pitch, yaw, thrust], dtype=np.float32)
         roll = clamp(roll, -limits.max_roll_rate, limits.max_roll_rate)
         pitch = clamp(pitch, -limits.max_pitch_rate, limits.max_pitch_rate)
         yaw = clamp(yaw, -limits.max_yaw_rate, limits.max_yaw_rate)
         thrust = clamp(thrust, limits.thrust_min, limits.thrust_max)
+        final_command = np.array([roll, pitch, yaw, thrust], dtype=np.float32)
+        self._last_policy_command[env_id] = policy_command
+        self._last_controller_command[env_id] = controller_command
+        self._last_unclipped_command[env_id] = unclipped_command
+        self._last_command_saturated[env_id] = ~np.isclose(
+            unclipped_command,
+            final_command,
+            rtol=1e-6,
+            atol=1e-7,
+        )
         return float(roll), float(pitch), float(yaw), float(thrust)
 
     def _obs_data(self, env_id: int) -> ObservationData:
@@ -1124,8 +1262,27 @@ class FastIrisLineFollowVecEnv:
             [float(self.config.action_limits.policy_ratio)],
             dtype=np.float32,
         )
+        local_tracking = np.array(
+            [
+                float(self._local_window_ready[env_id]),
+                self._local_soft_joint_quality[env_id],
+                self._local_xy_good_fraction[env_id],
+                self._local_velocity_good_fraction[env_id],
+                self._local_z_good_fraction[env_id],
+                self._local_xy_drift_delta_m[env_id]
+                / max(1e-3, self.task_config.moving_success_xy_tolerance_m),
+            ],
+            dtype=np.float32,
+        )
         privileged = np.concatenate(
-            (phase_one_hot, primitive_one_hot, scalars, dynamics, control_ratio)
+            (
+                phase_one_hot,
+                primitive_one_hot,
+                scalars,
+                dynamics,
+                control_ratio,
+                local_tracking,
+            )
         ).astype(np.float32)
         if privileged.shape != (self.privileged_obs_dim,):
             raise RuntimeError(
@@ -1488,6 +1645,40 @@ class FastIrisLineFollowVecEnv:
             and not capture_acquired_now
             and not target_stopped
         )
+        self._local_window_event[env_id] = False
+        reward_local_tracking = 0.0
+        reward_local_drift = 0.0
+        if moving_reward_active:
+            local_snapshot = self._tracking_quality_windows[env_id].append(
+                xy_err,
+                reward_velocity_error,
+                z_err,
+            )
+            self._local_window_ready[env_id] = local_snapshot.ready
+            self._local_window_event[env_id] = local_snapshot.reward_event
+            self._local_soft_joint_quality[env_id] = (
+                local_snapshot.soft_joint_quality
+            )
+            self._local_xy_good_fraction[env_id] = (
+                local_snapshot.xy_good_fraction
+            )
+            self._local_velocity_good_fraction[env_id] = (
+                local_snapshot.velocity_good_fraction
+            )
+            self._local_z_good_fraction[env_id] = (
+                local_snapshot.z_good_fraction
+            )
+            self._local_xy_drift_delta_m[env_id] = (
+                local_snapshot.drift_delta_m
+            )
+            reward_local_tracking, reward_local_drift = tracking_event_rewards(
+                local_snapshot,
+                self.task_config.local_tracking_hard_fraction_weight,
+                self.task_config.local_tracking_drift_deadband_m,
+                self.task_config.moving_success_xy_tolerance_m,
+                self.task_config.reward_local_tracking_scale,
+                self.task_config.reward_local_drift_scale,
+            )
         vertical_requirement_met = bool(
             self._vertical_eligible_steps[env_id] == 0
             or self._vertical_success_met[env_id]
@@ -1709,6 +1900,8 @@ class FastIrisLineFollowVecEnv:
             + reward_moving_recovery
             + reward_moving_velocity
             + reward_moving_good
+            + reward_local_tracking
+            + reward_local_drift
             + reward_stopped_position
             + reward_tilt
             + reward_control
@@ -1733,6 +1926,8 @@ class FastIrisLineFollowVecEnv:
             "reward_moving_recovery": float(reward_moving_recovery),
             "reward_moving_velocity": float(reward_moving_velocity),
             "reward_moving_good": float(reward_moving_good),
+            "reward_local_tracking": float(reward_local_tracking),
+            "reward_local_drift": float(reward_local_drift),
             "reward_stopped_position": float(reward_stopped_position),
             "reward_tilt": float(reward_tilt),
             "reward_control": float(reward_control),
@@ -1834,6 +2029,39 @@ class FastIrisLineFollowVecEnv:
             "cmd_pitch_rate": float(self._prev_action[env_id, 1]),
             "cmd_yaw_rate": float(self._prev_action[env_id, 2]),
             "cmd_thrust": float(self._prev_action[env_id, 3]),
+            "policy_cmd_roll_rate": float(self._last_policy_command[env_id, 0]),
+            "policy_cmd_pitch_rate": float(self._last_policy_command[env_id, 1]),
+            "policy_cmd_yaw_rate": float(self._last_policy_command[env_id, 2]),
+            "policy_cmd_thrust": float(self._last_policy_command[env_id, 3]),
+            "controller_cmd_roll_rate": float(
+                self._last_controller_command[env_id, 0]
+            ),
+            "controller_cmd_pitch_rate": float(
+                self._last_controller_command[env_id, 1]
+            ),
+            "controller_cmd_yaw_rate": float(
+                self._last_controller_command[env_id, 2]
+            ),
+            "controller_cmd_thrust": float(
+                self._last_controller_command[env_id, 3]
+            ),
+            "unclipped_cmd_roll_rate": float(
+                self._last_unclipped_command[env_id, 0]
+            ),
+            "unclipped_cmd_pitch_rate": float(
+                self._last_unclipped_command[env_id, 1]
+            ),
+            "unclipped_cmd_yaw_rate": float(
+                self._last_unclipped_command[env_id, 2]
+            ),
+            "unclipped_cmd_thrust": float(
+                self._last_unclipped_command[env_id, 3]
+            ),
+            "cmd_roll_saturated": bool(self._last_command_saturated[env_id, 0]),
+            "cmd_pitch_saturated": bool(self._last_command_saturated[env_id, 1]),
+            "cmd_yaw_saturated": bool(self._last_command_saturated[env_id, 2]),
+            "cmd_thrust_saturated": bool(self._last_command_saturated[env_id, 3]),
+            "cmd_any_saturated": bool(np.any(self._last_command_saturated[env_id])),
             "target_phase": phase,
             "primitive_id": str(self._primitive_id[env_id]),
             "primitive_code": int(self._primitive_code[env_id]),
@@ -1947,6 +2175,27 @@ class FastIrisLineFollowVecEnv:
             "moving_success_xy_tolerance_m": float(self.task_config.moving_success_xy_tolerance_m),
             "moving_success_velocity_tolerance_mps": float(
                 self.task_config.moving_success_velocity_tolerance_mps
+            ),
+            "local_tracking_window_ready": bool(
+                self._local_window_ready[env_id]
+            ),
+            "local_tracking_reward_event": bool(
+                self._local_window_event[env_id]
+            ),
+            "local_tracking_soft_joint_quality": float(
+                self._local_soft_joint_quality[env_id]
+            ),
+            "local_tracking_xy_good_fraction": float(
+                self._local_xy_good_fraction[env_id]
+            ),
+            "local_tracking_velocity_good_fraction": float(
+                self._local_velocity_good_fraction[env_id]
+            ),
+            "local_tracking_z_good_fraction": float(
+                self._local_z_good_fraction[env_id]
+            ),
+            "local_tracking_xy_drift_delta_m": float(
+                self._local_xy_drift_delta_m[env_id]
             ),
             "vertical_motion_eligible": bool(
                 self._vertical_motion_eligible[env_id]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import random
@@ -64,6 +65,12 @@ def parse_args():
     parser.add_argument("--actor_hidden_sizes", type=int, nargs="+", default=[256, 256, 128])
     parser.add_argument("--critic_hidden_sizes", type=int, nargs="+", default=[256, 256, 128])
     parser.add_argument("--recurrent_hidden_size", type=int, default=128)
+    parser.add_argument(
+        "--actor_recurrent_mode",
+        choices=("train", "frozen", "disabled"),
+        default="train",
+        help="Train, freeze, or zero-disable the Actor GRU residual branch.",
+    )
     parser.add_argument("--temporal_gate_init", type=float, default=0.05)
     parser.add_argument("--temporal_gate_warmup_updates", type=int, default=15)
     parser.add_argument("--reset_temporal_gate_on_load", action="store_true", default=False)
@@ -86,7 +93,21 @@ def parse_args():
     parser.add_argument("--num_mini_batch", type=int, default=4)
     parser.add_argument("--clip_param", type=float, default=0.2)
     parser.add_argument("--value_clip_param", type=float, default=0.2)
+    parser.add_argument(
+        "--value_loss_type",
+        choices=("clipped_mse", "unclipped_huber"),
+        default="clipped_mse",
+    )
+    parser.add_argument("--use_popart", action="store_true", default=False)
+    parser.add_argument(
+        "--no_popart",
+        action="store_false",
+        dest="use_popart",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument("--popart_beta", type=float, default=0.999)
     parser.add_argument("--target_kl", type=float, default=0.02)
+    parser.add_argument("--reference_kl_coef", type=float, default=0.0)
     parser.add_argument("--value_loss_coef", type=float, default=0.5)
     parser.add_argument("--entropy_coef", type=float, default=0.001)
     parser.add_argument("--entropy_coef_final", type=float, default=0.0001)
@@ -102,6 +123,8 @@ def parse_args():
         help="Keep the configured seed instead of restoring RNG states from a checkpoint.",
     )
     parser.add_argument("--from_scratch", action="store_true", default=False)
+    parser.add_argument("--evaluation_only", action="store_true", default=False)
+    parser.add_argument("--deterministic_actions", action="store_true", default=False)
     parser.add_argument("--save_interval", type=int, default=10)
     parser.add_argument("--best_checkpoint_window", type=int, default=0)
     parser.add_argument("--early_stop_patience_updates", type=int, default=0)
@@ -124,6 +147,13 @@ def parse_args():
     parser.add_argument("--attitude_feedback_scale", type=float, default=1.0)
     parser.add_argument("--randomize_yaw", action="store_true", default=False)
     parser.add_argument("--random_yaw_max_offset_deg", type=float, default=180.0)
+    parser.add_argument("--independent_env_rng", action="store_true", default=False)
+    parser.add_argument(
+        "--shared_env_rng",
+        action="store_false",
+        dest="independent_env_rng",
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument("--max_roll_rate", type=float, default=0.080)
     parser.add_argument("--max_pitch_rate", type=float, default=0.080)
     parser.add_argument("--max_yaw_rate", type=float, default=0.010)
@@ -231,6 +261,21 @@ def parse_args():
     parser.add_argument("--reward_position_recovery_scale", type=float, default=0.0)
     parser.add_argument("--reward_velocity_correction_gain", type=float, default=0.0)
     parser.add_argument("--reward_velocity_correction_max_mps", type=float, default=0.0)
+    parser.add_argument("--local_tracking_window_sec", type=float, default=2.0)
+    parser.add_argument(
+        "--local_tracking_reward_interval_sec", type=float, default=2.0
+    )
+    parser.add_argument(
+        "--local_tracking_velocity_tolerance_mps", type=float, default=0.25
+    )
+    parser.add_argument(
+        "--local_tracking_hard_fraction_weight", type=float, default=0.30
+    )
+    parser.add_argument(
+        "--local_tracking_drift_deadband_m", type=float, default=0.05
+    )
+    parser.add_argument("--reward_local_tracking_scale", type=float, default=0.0)
+    parser.add_argument("--reward_local_drift_scale", type=float, default=0.0)
     parser.add_argument("--max_tracking_error_m", type=float, default=3.0)
     parser.add_argument("--min_target_distance_m", type=float, default=0.35)
 
@@ -315,11 +360,26 @@ def parse_args():
             parser.error(f"--{name} must be positive")
     if args.num_mini_batch > args.num_envs:
         parser.error("--num_mini_batch cannot exceed --num_envs for recurrent PPO")
-    for name in ("lr", "critic_lr", "min_lr", "value_clip_param", "target_kl"):
+    for name in (
+        "lr",
+        "critic_lr",
+        "min_lr",
+        "value_clip_param",
+        "target_kl",
+        "reference_kl_coef",
+    ):
         if getattr(args, name) < 0.0:
             parser.error(f"--{name} must be non-negative")
     if args.init_action_std <= 0.0:
         parser.error("--init_action_std must be positive")
+    if not 0.0 <= args.popart_beta < 1.0:
+        parser.error("--popart_beta must be in [0, 1)")
+    if args.local_tracking_window_sec <= 0.0:
+        parser.error("--local_tracking_window_sec must be positive")
+    if args.local_tracking_reward_interval_sec <= 0.0:
+        parser.error("--local_tracking_reward_interval_sec must be positive")
+    if not 0.0 <= args.local_tracking_hard_fraction_weight <= 1.0:
+        parser.error("--local_tracking_hard_fraction_weight must be in [0, 1]")
     if not 0.0 <= args.policy_ratio <= 1.0:
         parser.error("--policy_ratio must be in [0, 1]")
     for name in (
@@ -332,6 +392,10 @@ def parse_args():
         "reward_position_recovery_scale",
         "reward_velocity_correction_gain",
         "reward_velocity_correction_max_mps",
+        "local_tracking_velocity_tolerance_mps",
+        "local_tracking_drift_deadband_m",
+        "reward_local_tracking_scale",
+        "reward_local_drift_scale",
         "reward_stop_speed_scale",
         "reward_braking_scale",
         "reward_stop_overspeed_scale",
@@ -423,6 +487,7 @@ def main():
     from pegasus_iris_fast_line_follow.motion_task import PRIMITIVE_CODES, MotionPoolConfig
     from pegasus_iris_fast_line_follow.ppo_core import (
         ActorCritic,
+        PopArtValueNormalizer,
         append_csv_row,
         compute_gae_vec,
         dump_json,
@@ -529,6 +594,7 @@ def main():
         takeoff_altitude=args.takeoff_altitude,
         render=args.render,
         seed=args.seed,
+        independent_env_rng=args.independent_env_rng,
         randomize_yaw_on_reset=args.randomize_yaw,
         random_yaw_max_offset_deg=args.random_yaw_max_offset_deg,
         yaw_hold_kp=args.yaw_hold_kp,
@@ -597,6 +663,21 @@ def main():
         reward_velocity_correction_max_mps=(
             args.reward_velocity_correction_max_mps
         ),
+        local_tracking_window_sec=args.local_tracking_window_sec,
+        local_tracking_reward_interval_sec=(
+            args.local_tracking_reward_interval_sec
+        ),
+        local_tracking_velocity_tolerance_mps=(
+            args.local_tracking_velocity_tolerance_mps
+        ),
+        local_tracking_hard_fraction_weight=(
+            args.local_tracking_hard_fraction_weight
+        ),
+        local_tracking_drift_deadband_m=(
+            args.local_tracking_drift_deadband_m
+        ),
+        reward_local_tracking_scale=args.reward_local_tracking_scale,
+        reward_local_drift_scale=args.reward_local_drift_scale,
         max_tracking_error_m=args.max_tracking_error_m,
         min_target_distance_m=args.min_target_distance_m,
         reward_position_scale=args.reward_position_scale,
@@ -625,6 +706,9 @@ def main():
     policy = None
     actor_optimizer = None
     critic_optimizer = None
+    value_normalizer = None
+    reference_policy = None
+    reference_hidden = None
     update_rows = []
     episode_rows = []
     total_steps = 0
@@ -679,6 +763,8 @@ def main():
         "primitive_good_fraction",
         "approx_kl",
         "clip_fraction",
+        "reference_kl",
+        "value_clip_fraction",
         "kl_early_stop",
         "actor_lr",
         "actor_backbone_lr",
@@ -687,11 +773,29 @@ def main():
         "temporal_gate_raw",
         "temporal_gate_effective",
         "temporal_gate_frozen",
+        "actor_recurrent_mode",
         "entropy_coef_current",
         "explained_variance",
+        "return_mean",
+        "return_std",
+        "raw_value_mean",
+        "raw_value_std",
+        "popart_mean",
+        "popart_std",
         "action_mean",
         "action_std",
         "action_abs_mean",
+        "cmd_saturation_fraction",
+        "cmd_roll_saturation_fraction",
+        "cmd_pitch_saturation_fraction",
+        "cmd_yaw_saturation_fraction",
+        "cmd_thrust_saturation_fraction",
+        "mean_abs_policy_cmd_roll_rate",
+        "mean_abs_policy_cmd_pitch_rate",
+        "mean_abs_controller_cmd_roll_rate",
+        "mean_abs_controller_cmd_pitch_rate",
+        "mean_abs_final_cmd_roll_rate",
+        "mean_abs_final_cmd_pitch_rate",
         "mean_target_speed",
         "mean_tracking_velocity_error",
         "mean_reward_velocity_error",
@@ -706,6 +810,13 @@ def main():
         "moving_z_good_sample_fraction",
         "moving_velocity_good_sample_fraction",
         "moving_good_sample_fraction",
+        "local_tracking_ready_fraction",
+        "local_tracking_event_count",
+        "mean_local_tracking_soft_joint_quality",
+        "mean_local_tracking_xy_good_fraction",
+        "mean_local_tracking_velocity_good_fraction",
+        "mean_local_tracking_z_good_fraction",
+        "mean_local_tracking_xy_drift_delta_m",
         "vertical_success_met_fraction",
         "mean_vertical_good_fraction",
         "vertical_position_good_sample_fraction",
@@ -757,6 +868,15 @@ def main():
         "final_cmd_pitch_rate",
         "final_cmd_yaw_rate",
         "final_cmd_thrust",
+        "final_policy_cmd_roll_rate",
+        "final_policy_cmd_pitch_rate",
+        "final_policy_cmd_yaw_rate",
+        "final_policy_cmd_thrust",
+        "final_controller_cmd_roll_rate",
+        "final_controller_cmd_pitch_rate",
+        "final_controller_cmd_yaw_rate",
+        "final_controller_cmd_thrust",
+        "final_cmd_any_saturated",
         "final_target_phase",
         "final_primitive_id",
         "final_primitive_code",
@@ -797,6 +917,11 @@ def main():
         "moving_xy_good_fraction",
         "moving_z_good_fraction",
         "moving_velocity_good_fraction",
+        "local_tracking_soft_joint_quality",
+        "local_tracking_xy_good_fraction",
+        "local_tracking_velocity_good_fraction",
+        "local_tracking_z_good_fraction",
+        "local_tracking_xy_drift_delta_m",
         "vertical_success_met",
         "vertical_eligible_steps",
         "vertical_position_good_steps",
@@ -875,6 +1000,11 @@ def main():
             init_std=args.init_action_std,
         ).to(device)
         print("[FAST PPO] ActorCritic initialized", flush=True)
+        value_normalizer = (
+            PopArtValueNormalizer(device=device, beta=args.popart_beta)
+            if args.use_popart
+            else None
+        )
         checkpoint_payload = {}
         if args.from_scratch:
             print("[FAST PPO] starting from scratch")
@@ -898,23 +1028,49 @@ def main():
                 )
         else:
             print("[FAST PPO] starting from scratch (no checkpoint supplied)")
+        if args.actor_recurrent_mode == "disabled":
+            with torch.no_grad():
+                policy.temporal_gate.zero_()
+            for parameter in policy.actor_recurrent_parameters():
+                parameter.requires_grad_(False)
+            print("[FAST PPO] Actor GRU residual branch disabled (gate=0)")
+        elif args.actor_recurrent_mode == "frozen":
+            for parameter in policy.actor_recurrent_parameters():
+                parameter.requires_grad_(False)
+            print(
+                "[FAST PPO] Actor GRU residual branch frozen at "
+                f"effective_gate={float(torch.tanh(policy.temporal_gate)):.6f}"
+            )
+
         actor_backbone_parameters = list(policy.actor_backbone_parameters())
-        actor_recurrent_parameters = list(policy.actor_recurrent_parameters())
-        actor_parameters = [*actor_backbone_parameters, *actor_recurrent_parameters]
+        actor_recurrent_parameters = (
+            list(policy.actor_recurrent_parameters())
+            if args.actor_recurrent_mode == "train"
+            else []
+        )
+        actor_parameters = [
+            parameter
+            for parameter in (*actor_backbone_parameters, *actor_recurrent_parameters)
+            if parameter.requires_grad
+        ]
         critic_parameters = list(policy.critic_parameters())
-        actor_optimizer = torch.optim.Adam(
-            [
-                {
-                    "params": actor_backbone_parameters,
-                    "lr_multiplier": args.actor_backbone_lr_multiplier,
-                    "group_name": "backbone",
-                },
+        actor_parameter_groups = [
+            {
+                "params": actor_backbone_parameters,
+                "lr_multiplier": args.actor_backbone_lr_multiplier,
+                "group_name": "backbone",
+            }
+        ]
+        if actor_recurrent_parameters:
+            actor_parameter_groups.append(
                 {
                     "params": actor_recurrent_parameters,
                     "lr_multiplier": args.actor_recurrent_lr_multiplier,
                     "group_name": "recurrent",
-                },
-            ],
+                }
+            )
+        actor_optimizer = torch.optim.Adam(
+            actor_parameter_groups,
             lr=args.lr,
         )
         critic_optimizer = torch.optim.Adam(critic_parameters, lr=args.critic_lr)
@@ -925,13 +1081,44 @@ def main():
                 critic_optimizer,
                 env_rng=env._rng,
                 restore_rng=not args.reset_rng_on_load,
+                value_normalizer=value_normalizer,
             )
-        temporal_gate_frozen = args.temporal_gate_warmup_updates > 0
-        policy.temporal_gate.requires_grad_(not temporal_gate_frozen)
+        elif checkpoint_payload and value_normalizer is not None:
+            normalizer_state = checkpoint_payload.get("value_normalizer_state")
+            if normalizer_state is not None:
+                value_normalizer.load_state_dict(normalizer_state)
+                print("[FAST PPO] restored PopArt state with fresh optimizers")
+            else:
+                print(
+                    "[FAST PPO] checkpoint has no PopArt state; "
+                    "using identity initialization"
+                )
+        temporal_gate_frozen = bool(
+            args.actor_recurrent_mode != "train"
+            or args.temporal_gate_warmup_updates > 0
+        )
+        if args.actor_recurrent_mode == "train":
+            policy.temporal_gate.requires_grad_(not temporal_gate_frozen)
         if temporal_gate_frozen:
+            if args.actor_recurrent_mode == "train":
+                print(
+                    "[FAST PPO] temporal gate fixed for the first "
+                    f"{args.temporal_gate_warmup_updates} updates"
+                )
+        if args.reference_kl_coef > 0.0 and not args.evaluation_only:
+            reference_policy = copy.deepcopy(policy).to(device)
+            reference_state = checkpoint_payload.get(
+                "reference_policy_state_dict"
+            )
+            if reference_state is not None:
+                reference_policy.load_state_dict(reference_state)
+                print("[FAST PPO] restored fixed reference-policy anchor")
+            reference_policy.eval()
+            for parameter in reference_policy.parameters():
+                parameter.requires_grad_(False)
             print(
-                "[FAST PPO] temporal gate fixed for the first "
-                f"{args.temporal_gate_warmup_updates} updates"
+                "[FAST PPO] fixed reference-policy KL enabled: "
+                f"coef={args.reference_kl_coef}"
             )
 
         print("=" * 88)
@@ -952,7 +1139,8 @@ def main():
             f"(future_ref={env.future_reference_dim} privileged), "
             f"action_dim: {env.action_dim}, "
             f"actor={args.actor_hidden_sizes}, critic={args.critic_hidden_sizes}, "
-            f"gru={args.recurrent_hidden_size}, temporal_gate_init={args.temporal_gate_init}, "
+            f"gru={args.recurrent_hidden_size}, recurrent_mode={args.actor_recurrent_mode}, "
+            f"temporal_gate_init={args.temporal_gate_init}, "
             f"activation={args.activation}, distribution=tanh_squashed_normal, "
             f"parameters={sum(parameter.numel() for parameter in policy.parameters())}"
         )
@@ -965,6 +1153,13 @@ def main():
             "actor_learning_rates: "
             f"backbone={args.actor_backbone_lr_multiplier}x, "
             f"recurrent={args.actor_recurrent_lr_multiplier}x base actor LR"
+        )
+        print(
+            "critic_learning: "
+            f"value_loss={args.value_loss_type}, popart={args.use_popart}, "
+            f"popart_beta={args.popart_beta}, value_clip={args.value_clip_param}; "
+            f"gamma={args.gamma}, gae_lambda={args.gae_lambda}, "
+            f"reference_kl_coef={args.reference_kl_coef}"
         )
         line_length_description = (
             f"[{args.line_length_min_m}, {args.line_length_max_m}]m "
@@ -1046,6 +1241,10 @@ def main():
             f"capture_once={args.reward_capture_once}, capture_hold={args.reward_capture_hold}, "
             f"capture_tracking={args.reward_capture_tracking_scale}, "
             f"moving_good={args.reward_moving_good}, "
+            f"local_window={args.local_tracking_window_sec}s, "
+            f"local_interval={args.local_tracking_reward_interval_sec}s, "
+            f"local_tracking={args.reward_local_tracking_scale}, "
+            f"local_drift={args.reward_local_drift_scale}, "
             f"stopped_time={args.reward_stopped_time_penalty}, "
             f"goal_zone={args.reward_goal_zone}, dwell={args.reward_dwell_scale}, "
             f"success={args.reward_success}, timeout={args.reward_timeout}, crash={args.reward_crash}"
@@ -1074,12 +1273,20 @@ def main():
         obs = env.reset()
         critic_obs = env.build_critic_obs(obs)
         recurrent_hidden = policy.initial_state(args.num_envs, device=device)
+        if reference_policy is not None:
+            reference_hidden = reference_policy.initial_state(
+                args.num_envs, device=device
+            )
         episode_start = np.ones(args.num_envs, dtype=bool)
         best_checkpoint_score = -math.inf
         best_checkpoint_update = 0
         degradation_updates = 0
         while total_steps < args.num_env_steps:
-            if temporal_gate_frozen and update >= args.temporal_gate_warmup_updates:
+            if (
+                args.actor_recurrent_mode == "train"
+                and temporal_gate_frozen
+                and update >= args.temporal_gate_warmup_updates
+            ):
                 policy.temporal_gate.requires_grad_(True)
                 temporal_gate_frozen = False
                 print(
@@ -1096,6 +1303,11 @@ def main():
             value_buf = []
             episode_start_buf = []
             rollout_initial_hidden = recurrent_hidden.detach().clone()
+            rollout_initial_reference_hidden = (
+                reference_hidden.detach().clone()
+                if reference_hidden is not None
+                else None
+            )
             stats_rewards = []
             stats_reasons = Counter()
             stats_xy = []
@@ -1122,6 +1334,27 @@ def main():
             stats_moving_z_good_sample = []
             stats_moving_velocity_good_sample = []
             stats_moving_good_sample = []
+            stats_local_tracking_ready = []
+            stats_local_tracking_events = []
+            stats_local_tracking_soft_quality = []
+            stats_local_tracking_xy_fraction = []
+            stats_local_tracking_velocity_fraction = []
+            stats_local_tracking_z_fraction = []
+            stats_local_tracking_drift = []
+            stats_cmd_saturation = {
+                key: [] for key in ("any", "roll", "pitch", "yaw", "thrust")
+            }
+            stats_abs_commands = {
+                key: []
+                for key in (
+                    "policy_roll",
+                    "policy_pitch",
+                    "controller_roll",
+                    "controller_pitch",
+                    "final_roll",
+                    "final_pitch",
+                )
+            }
             stats_vertical_met = []
             stats_vertical_good_fraction = []
             stats_vertical_position_good_sample = []
@@ -1162,12 +1395,25 @@ def main():
                     device=device,
                 )
                 with torch.no_grad():
-                    action_t, logprob_t, value_t, recurrent_hidden = policy.act(
-                        obs_t,
-                        critic_obs_t,
-                        recurrent_hidden,
-                        episode_start_t,
+                    act_fn = (
+                        policy.act_deterministic
+                        if args.deterministic_actions
+                        else policy.act
                     )
+                    action_t, logprob_t, value_t, recurrent_hidden = act_fn(
+                        obs_t, critic_obs_t, recurrent_hidden, episode_start_t
+                    )
+                    raw_value_t = (
+                        value_normalizer.denormalize(value_t)
+                        if value_normalizer is not None
+                        else value_t
+                    )
+                    if reference_policy is not None:
+                        _, reference_hidden = reference_policy.deterministic_action(
+                            obs_t,
+                            reference_hidden,
+                            episode_start_t,
+                        )
                 actions = action_t.detach().cpu().numpy().astype(np.float32)
                 next_obs, rewards, dones, infos = env.step(actions)
                 next_critic_obs = env.build_critic_obs(next_obs)
@@ -1176,7 +1422,9 @@ def main():
                 critic_obs_buf.append(critic_obs.copy())
                 action_buf.append(actions.copy())
                 logprob_buf.append(logprob_t.detach().cpu().numpy().astype(np.float32))
-                value_buf.append(value_t.detach().cpu().numpy().astype(np.float32))
+                value_buf.append(
+                    raw_value_t.detach().cpu().numpy().astype(np.float32)
+                )
                 reward_buf.append(rewards.copy())
                 done_buf.append(dones.copy())
                 episode_start_buf.append(episode_start.copy())
@@ -1219,6 +1467,75 @@ def main():
                     stats_capture_dwell.append(float(info.get("capture_dwell_fraction", 0.0)))
                     stats_moving_met.append(1.0 if info.get("moving_success_met") else 0.0)
                     stats_moving_good_fraction.append(float(info.get("moving_good_fraction", 0.0)))
+                    local_ready = bool(
+                        info.get("local_tracking_window_ready", False)
+                    )
+                    stats_local_tracking_ready.append(1.0 if local_ready else 0.0)
+                    if local_ready:
+                        stats_local_tracking_soft_quality.append(
+                            float(
+                                info.get(
+                                    "local_tracking_soft_joint_quality", 0.0
+                                )
+                            )
+                        )
+                        stats_local_tracking_xy_fraction.append(
+                            float(
+                                info.get(
+                                    "local_tracking_xy_good_fraction", 0.0
+                                )
+                            )
+                        )
+                        stats_local_tracking_velocity_fraction.append(
+                            float(
+                                info.get(
+                                    "local_tracking_velocity_good_fraction", 0.0
+                                )
+                            )
+                        )
+                        stats_local_tracking_z_fraction.append(
+                            float(
+                                info.get(
+                                    "local_tracking_z_good_fraction", 0.0
+                                )
+                            )
+                        )
+                        stats_local_tracking_drift.append(
+                            float(
+                                info.get(
+                                    "local_tracking_xy_drift_delta_m", 0.0
+                                )
+                            )
+                        )
+                    if info.get("local_tracking_reward_event", False):
+                        stats_local_tracking_events.append(1.0)
+                    stats_cmd_saturation["any"].append(
+                        1.0 if info.get("cmd_any_saturated", False) else 0.0
+                    )
+                    for axis in ("roll", "pitch", "yaw", "thrust"):
+                        stats_cmd_saturation[axis].append(
+                            1.0
+                            if info.get(f"cmd_{axis}_saturated", False)
+                            else 0.0
+                        )
+                    stats_abs_commands["policy_roll"].append(
+                        abs(float(info.get("policy_cmd_roll_rate", 0.0)))
+                    )
+                    stats_abs_commands["policy_pitch"].append(
+                        abs(float(info.get("policy_cmd_pitch_rate", 0.0)))
+                    )
+                    stats_abs_commands["controller_roll"].append(
+                        abs(float(info.get("controller_cmd_roll_rate", 0.0)))
+                    )
+                    stats_abs_commands["controller_pitch"].append(
+                        abs(float(info.get("controller_cmd_pitch_rate", 0.0)))
+                    )
+                    stats_abs_commands["final_roll"].append(
+                        abs(float(info.get("cmd_roll_rate", 0.0)))
+                    )
+                    stats_abs_commands["final_pitch"].append(
+                        abs(float(info.get("cmd_pitch_rate", 0.0)))
+                    )
                     moving_track_eligible = bool(info.get("moving_track_eligible", False))
                     if moving_track_eligible:
                         stats_moving_xy_good_sample.append(
@@ -1363,6 +1680,33 @@ def main():
                             "final_cmd_pitch_rate": float(info.get("cmd_pitch_rate", 0.0)),
                             "final_cmd_yaw_rate": float(info.get("cmd_yaw_rate", 0.0)),
                             "final_cmd_thrust": float(info.get("cmd_thrust", 0.0)),
+                            "final_policy_cmd_roll_rate": float(
+                                info.get("policy_cmd_roll_rate", 0.0)
+                            ),
+                            "final_policy_cmd_pitch_rate": float(
+                                info.get("policy_cmd_pitch_rate", 0.0)
+                            ),
+                            "final_policy_cmd_yaw_rate": float(
+                                info.get("policy_cmd_yaw_rate", 0.0)
+                            ),
+                            "final_policy_cmd_thrust": float(
+                                info.get("policy_cmd_thrust", 0.0)
+                            ),
+                            "final_controller_cmd_roll_rate": float(
+                                info.get("controller_cmd_roll_rate", 0.0)
+                            ),
+                            "final_controller_cmd_pitch_rate": float(
+                                info.get("controller_cmd_pitch_rate", 0.0)
+                            ),
+                            "final_controller_cmd_yaw_rate": float(
+                                info.get("controller_cmd_yaw_rate", 0.0)
+                            ),
+                            "final_controller_cmd_thrust": float(
+                                info.get("controller_cmd_thrust", 0.0)
+                            ),
+                            "final_cmd_any_saturated": bool(
+                                info.get("cmd_any_saturated", False)
+                            ),
                             "final_target_phase": str(info.get("target_phase", "unknown")),
                             "final_primitive_id": str(info.get("primitive_id", "unknown")),
                             "final_primitive_code": int(info.get("primitive_code", -1)),
@@ -1424,6 +1768,25 @@ def main():
                             ),
                             "moving_velocity_good_fraction": float(
                                 info.get("moving_velocity_good_fraction", 0.0)
+                            ),
+                            "local_tracking_soft_joint_quality": float(
+                                info.get(
+                                    "local_tracking_soft_joint_quality", 0.0
+                                )
+                            ),
+                            "local_tracking_xy_good_fraction": float(
+                                info.get("local_tracking_xy_good_fraction", 0.0)
+                            ),
+                            "local_tracking_velocity_good_fraction": float(
+                                info.get(
+                                    "local_tracking_velocity_good_fraction", 0.0
+                                )
+                            ),
+                            "local_tracking_z_good_fraction": float(
+                                info.get("local_tracking_z_good_fraction", 0.0)
+                            ),
+                            "local_tracking_xy_drift_delta_m": float(
+                                info.get("local_tracking_xy_drift_delta_m", 0.0)
                             ),
                             "vertical_success_met": bool(
                                 info.get("vertical_success_met", False)
@@ -1528,9 +1891,12 @@ def main():
                     break
 
             with torch.no_grad():
-                last_values = policy.value(
+                last_values_t = policy.value(
                     torch.as_tensor(critic_obs, dtype=torch.float32, device=device)
-                ).detach().cpu().numpy()
+                )
+                if value_normalizer is not None:
+                    last_values_t = value_normalizer.denormalize(last_values_t)
+                last_values = last_values_t.detach().cpu().numpy()
             rewards_np = np.asarray(reward_buf, dtype=np.float32)
             dones_np = np.asarray(done_buf, dtype=bool)
             values_np = np.asarray(value_buf, dtype=np.float32)
@@ -1545,8 +1911,24 @@ def main():
             )
             actions_seq = torch.as_tensor(np.asarray(action_buf, dtype=np.float32), dtype=torch.float32, device=device)
             old_logprob_seq = torch.as_tensor(np.asarray(logprob_buf, dtype=np.float32), dtype=torch.float32, device=device)
-            old_values_seq = torch.as_tensor(values_np, dtype=torch.float32, device=device)
-            returns_seq = torch.as_tensor(returns, dtype=torch.float32, device=device)
+            raw_old_values_seq = torch.as_tensor(
+                values_np, dtype=torch.float32, device=device
+            )
+            raw_returns_seq = torch.as_tensor(
+                returns, dtype=torch.float32, device=device
+            )
+            if value_normalizer is not None:
+                if not args.evaluation_only:
+                    value_normalizer.update(
+                        raw_returns_seq,
+                        policy.critic,
+                        optimizer=critic_optimizer,
+                    )
+                old_values_seq = value_normalizer.normalize(raw_old_values_seq)
+                returns_seq = value_normalizer.normalize(raw_returns_seq)
+            else:
+                old_values_seq = raw_old_values_seq
+                returns_seq = raw_returns_seq
             advantages_seq = torch.as_tensor(advantages, dtype=torch.float32, device=device)
             episode_starts_seq = torch.as_tensor(
                 np.asarray(episode_start_buf, dtype=np.float32),
@@ -1566,7 +1948,11 @@ def main():
             for group in critic_optimizer.param_groups:
                 group["lr"] = critic_lr
             actor_backbone_lr = actor_lr * args.actor_backbone_lr_multiplier
-            actor_recurrent_lr = actor_lr * args.actor_recurrent_lr_multiplier
+            actor_recurrent_lr = (
+                actor_lr * args.actor_recurrent_lr_multiplier
+                if actor_recurrent_parameters
+                else 0.0
+            )
             entropy_coef = (
                 args.entropy_coef
                 + schedule_progress * (args.entropy_coef_final - args.entropy_coef)
@@ -1577,9 +1963,11 @@ def main():
             entropies = []
             approx_kls = []
             clip_fractions = []
+            reference_kls = []
+            value_clip_fractions = []
             kl_early_stop = False
 
-            for _ in range(args.ppo_epoch):
+            for _ in range(0 if args.evaluation_only else args.ppo_epoch):
                 env_indices = np.arange(args.num_envs)
                 np.random.shuffle(env_indices)
                 for mb_env_ids in np.array_split(env_indices, args.num_mini_batch):
@@ -1601,17 +1989,39 @@ def main():
                         * advantages_seq[:, mb]
                     )
                     policy_loss = -torch.min(surr1, surr2).mean()
-                    value_clipped = old_values_seq[:, mb] + torch.clamp(
-                        value - old_values_seq[:, mb],
-                        -args.value_clip_param,
-                        args.value_clip_param,
+                    value_delta = value - old_values_seq[:, mb]
+                    with torch.no_grad():
+                        value_clip_fraction = (
+                            (value_delta.abs() > args.value_clip_param)
+                            .float()
+                            .mean()
+                            if args.value_clip_param > 0.0
+                            else torch.zeros((), device=device)
+                        )
+                    value_clip_fractions.append(
+                        float(value_clip_fraction.item())
                     )
-                    value_loss_unclipped = torch.square(value - returns_seq[:, mb])
-                    value_loss_clipped = torch.square(value_clipped - returns_seq[:, mb])
-                    value_loss = 0.5 * torch.maximum(
-                        value_loss_unclipped,
-                        value_loss_clipped,
-                    ).mean()
+                    if args.value_loss_type == "unclipped_huber":
+                        value_loss = torch.nn.functional.smooth_l1_loss(
+                            value,
+                            returns_seq[:, mb],
+                        )
+                    else:
+                        value_clipped = old_values_seq[:, mb] + torch.clamp(
+                            value_delta,
+                            -args.value_clip_param,
+                            args.value_clip_param,
+                        )
+                        value_loss_unclipped = torch.square(
+                            value - returns_seq[:, mb]
+                        )
+                        value_loss_clipped = torch.square(
+                            value_clipped - returns_seq[:, mb]
+                        )
+                        value_loss = 0.5 * torch.maximum(
+                            value_loss_unclipped,
+                            value_loss_clipped,
+                        ).mean()
                     entropy_loss = entropy.mean()
                     with torch.no_grad():
                         approx_kl = ((ratio - 1.0) - log_ratio).mean()
@@ -1622,7 +2032,38 @@ def main():
                         kl_early_stop = True
                         break
 
-                    actor_loss = policy_loss - entropy_coef * entropy_loss
+                    reference_kl = torch.zeros((), device=device)
+                    if reference_policy is not None:
+                        current_mean, current_std, _ = (
+                            policy.distribution_parameters_sequence(
+                                obs_seq[:, mb],
+                                rollout_initial_hidden[mb],
+                                episode_starts_seq[:, mb],
+                            )
+                        )
+                        with torch.no_grad():
+                            reference_mean, reference_std, _ = (
+                                reference_policy.distribution_parameters_sequence(
+                                    obs_seq[:, mb],
+                                    rollout_initial_reference_hidden[mb],
+                                    episode_starts_seq[:, mb],
+                                )
+                            )
+                        reference_kl = (
+                            torch.log(reference_std / current_std)
+                            + (
+                                torch.square(current_std)
+                                + torch.square(current_mean - reference_mean)
+                            )
+                            / (2.0 * torch.square(reference_std))
+                            - 0.5
+                        ).sum(dim=-1).mean()
+                        reference_kls.append(float(reference_kl.item()))
+                    actor_loss = (
+                        policy_loss
+                        - entropy_coef * entropy_loss
+                        + args.reference_kl_coef * reference_kl
+                    )
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
                     torch.nn.utils.clip_grad_norm_(actor_parameters, args.max_grad_norm)
@@ -1639,16 +2080,23 @@ def main():
                     break
 
             update += 1
-            save_policy_checkpoint(
-                model_dir / "actor_critic.pt",
-                policy,
-                update,
-                total_steps,
-                actor_optimizer,
-                critic_optimizer,
-                env._rng,
-            )
-            if args.save_interval > 0 and update % args.save_interval == 0:
+            if not args.evaluation_only:
+                save_policy_checkpoint(
+                    model_dir / "actor_critic.pt",
+                    policy,
+                    update,
+                    total_steps,
+                    actor_optimizer,
+                    critic_optimizer,
+                    env._rng,
+                    value_normalizer,
+                    reference_policy,
+                )
+            if (
+                not args.evaluation_only
+                and args.save_interval > 0
+                and update % args.save_interval == 0
+            ):
                 save_policy_checkpoint(
                     model_dir / f"actor_critic_update_{update}.pt",
                     policy,
@@ -1657,12 +2105,19 @@ def main():
                     actor_optimizer,
                     critic_optimizer,
                     env._rng,
+                    value_normalizer,
+                    reference_policy,
                 )
             with torch.no_grad():
-                value_pred = policy.value(
+                value_pred_t = policy.value(
                     critic_obs_seq.reshape(-1, env.critic_obs_dim)
-                ).detach().cpu().numpy()
+                )
+                if value_normalizer is not None:
+                    value_pred_t = value_normalizer.denormalize(value_pred_t)
+                value_pred = value_pred_t.detach().cpu().numpy()
             recurrent_hidden = recurrent_hidden.detach()
+            if reference_hidden is not None:
+                reference_hidden = reference_hidden.detach()
             actions_np = np.asarray(action_buf, dtype=np.float32)
             mean_reward_terms = {
                 f"mean_{key}": float(np.mean(values)) if values else 0.0
@@ -1799,6 +2254,14 @@ def main():
                 ),
                 "approx_kl": float(np.mean(approx_kls)) if approx_kls else 0.0,
                 "clip_fraction": float(np.mean(clip_fractions)) if clip_fractions else 0.0,
+                "reference_kl": (
+                    float(np.mean(reference_kls)) if reference_kls else 0.0
+                ),
+                "value_clip_fraction": (
+                    float(np.mean(value_clip_fractions))
+                    if value_clip_fractions
+                    else 0.0
+                ),
                 "kl_early_stop": bool(kl_early_stop),
                 "actor_lr": float(actor_lr),
                 "actor_backbone_lr": float(actor_backbone_lr),
@@ -1809,11 +2272,59 @@ def main():
                     torch.tanh(policy.temporal_gate).detach().cpu()
                 ),
                 "temporal_gate_frozen": bool(temporal_gate_frozen),
+                "actor_recurrent_mode": args.actor_recurrent_mode,
                 "entropy_coef_current": float(entropy_coef),
                 "explained_variance": explained_variance(value_pred, returns.reshape(-1)),
+                "return_mean": float(np.mean(returns)),
+                "return_std": float(np.std(returns)),
+                "raw_value_mean": float(np.mean(value_pred)),
+                "raw_value_std": float(np.std(value_pred)),
+                "popart_mean": (
+                    float(value_normalizer.mean.detach().cpu())
+                    if value_normalizer is not None
+                    else 0.0
+                ),
+                "popart_std": (
+                    float(value_normalizer.std.detach().cpu())
+                    if value_normalizer is not None
+                    else 1.0
+                ),
                 "action_mean": float(np.mean(actions_np)) if actions_np.size else 0.0,
                 "action_std": float(np.std(actions_np)) if actions_np.size else 0.0,
                 "action_abs_mean": float(np.mean(np.abs(actions_np))) if actions_np.size else 0.0,
+                "cmd_saturation_fraction": float(
+                    np.mean(stats_cmd_saturation["any"])
+                ),
+                "cmd_roll_saturation_fraction": float(
+                    np.mean(stats_cmd_saturation["roll"])
+                ),
+                "cmd_pitch_saturation_fraction": float(
+                    np.mean(stats_cmd_saturation["pitch"])
+                ),
+                "cmd_yaw_saturation_fraction": float(
+                    np.mean(stats_cmd_saturation["yaw"])
+                ),
+                "cmd_thrust_saturation_fraction": float(
+                    np.mean(stats_cmd_saturation["thrust"])
+                ),
+                "mean_abs_policy_cmd_roll_rate": float(
+                    np.mean(stats_abs_commands["policy_roll"])
+                ),
+                "mean_abs_policy_cmd_pitch_rate": float(
+                    np.mean(stats_abs_commands["policy_pitch"])
+                ),
+                "mean_abs_controller_cmd_roll_rate": float(
+                    np.mean(stats_abs_commands["controller_roll"])
+                ),
+                "mean_abs_controller_cmd_pitch_rate": float(
+                    np.mean(stats_abs_commands["controller_pitch"])
+                ),
+                "mean_abs_final_cmd_roll_rate": float(
+                    np.mean(stats_abs_commands["final_roll"])
+                ),
+                "mean_abs_final_cmd_pitch_rate": float(
+                    np.mean(stats_abs_commands["final_pitch"])
+                ),
                 "mean_target_speed": float(np.mean(stats_target_speed)) if stats_target_speed else 0.0,
                 "mean_tracking_velocity_error": float(np.mean(stats_tracking_vel)) if stats_tracking_vel else 0.0,
                 "mean_reward_velocity_error": (
@@ -1858,6 +2369,39 @@ def main():
                 "moving_good_sample_fraction": (
                     float(np.mean(stats_moving_good_sample))
                     if stats_moving_good_sample
+                    else 0.0
+                ),
+                "local_tracking_ready_fraction": (
+                    float(np.mean(stats_local_tracking_ready))
+                    if stats_local_tracking_ready
+                    else 0.0
+                ),
+                "local_tracking_event_count": int(
+                    len(stats_local_tracking_events)
+                ),
+                "mean_local_tracking_soft_joint_quality": (
+                    float(np.mean(stats_local_tracking_soft_quality))
+                    if stats_local_tracking_soft_quality
+                    else 0.0
+                ),
+                "mean_local_tracking_xy_good_fraction": (
+                    float(np.mean(stats_local_tracking_xy_fraction))
+                    if stats_local_tracking_xy_fraction
+                    else 0.0
+                ),
+                "mean_local_tracking_velocity_good_fraction": (
+                    float(np.mean(stats_local_tracking_velocity_fraction))
+                    if stats_local_tracking_velocity_fraction
+                    else 0.0
+                ),
+                "mean_local_tracking_z_good_fraction": (
+                    float(np.mean(stats_local_tracking_z_fraction))
+                    if stats_local_tracking_z_fraction
+                    else 0.0
+                ),
+                "mean_local_tracking_xy_drift_delta_m": (
+                    float(np.mean(stats_local_tracking_drift))
+                    if stats_local_tracking_drift
                     else 0.0
                 ),
                 "vertical_success_met_fraction": (
@@ -1995,7 +2539,7 @@ def main():
             update_rows.append(update_row)
             append_csv_row(metrics_dir / "update_metrics.csv", update_fields, update_row)
             write_tensorboard_scalars(writer, update_row, total_steps)
-            if best_checkpoint_saved:
+            if best_checkpoint_saved and not args.evaluation_only:
                 save_policy_checkpoint(
                     model_dir / "actor_critic_best.pt",
                     policy,
@@ -2004,6 +2548,8 @@ def main():
                     actor_optimizer,
                     critic_optimizer,
                     env._rng,
+                    value_normalizer,
+                    reference_policy,
                 )
                 dump_json(
                     model_dir / "actor_critic_best.json",
@@ -2101,6 +2647,7 @@ def main():
             print(
                 f"  approx_kl: {update_row['approx_kl']:.6f}, "
                 f"clip_fraction: {update_row['clip_fraction']:.3f}, "
+                f"reference_kl: {update_row['reference_kl']:.6f}, "
                 f"kl_early_stop: {update_row['kl_early_stop']}"
             )
             print(
@@ -2113,9 +2660,37 @@ def main():
             print(
                 f"  temporal_gate: raw={update_row['temporal_gate_raw']:.6f}, "
                 f"effective={update_row['temporal_gate_effective']:.6f}, "
-                f"frozen={update_row['temporal_gate_frozen']}"
+                f"frozen={update_row['temporal_gate_frozen']}, "
+                f"mode={update_row['actor_recurrent_mode']}"
             )
-            print(f"  explained_variance: {update_row['explained_variance']:.3f}, action_abs_mean: {update_row['action_abs_mean']:.3f}")
+            print(
+                f"  critic: explained_variance={update_row['explained_variance']:.3f}, "
+                f"return={update_row['return_mean']:.3f}+/-{update_row['return_std']:.3f}, "
+                f"value_clip_fraction={update_row['value_clip_fraction']:.3f}, "
+                f"popart={update_row['popart_mean']:.3f}+/-{update_row['popart_std']:.3f}"
+            )
+            print(
+                f"  control: action_abs_mean={update_row['action_abs_mean']:.3f}, "
+                f"saturation={update_row['cmd_saturation_fraction']:.3f}, "
+                f"roll(policy/helper/final)="
+                f"{update_row['mean_abs_policy_cmd_roll_rate']:.4f}/"
+                f"{update_row['mean_abs_controller_cmd_roll_rate']:.4f}/"
+                f"{update_row['mean_abs_final_cmd_roll_rate']:.4f}, "
+                f"pitch(policy/helper/final)="
+                f"{update_row['mean_abs_policy_cmd_pitch_rate']:.4f}/"
+                f"{update_row['mean_abs_controller_cmd_pitch_rate']:.4f}/"
+                f"{update_row['mean_abs_final_cmd_pitch_rate']:.4f}"
+            )
+            print(
+                "  local_tracking: "
+                f"ready={update_row['local_tracking_ready_fraction']:.3f}, "
+                f"events={update_row['local_tracking_event_count']}, "
+                f"quality={update_row['mean_local_tracking_soft_joint_quality']:.3f}, "
+                f"xy={update_row['mean_local_tracking_xy_good_fraction']:.3f}, "
+                f"velocity={update_row['mean_local_tracking_velocity_good_fraction']:.3f}, "
+                f"z={update_row['mean_local_tracking_z_good_fraction']:.3f}, "
+                f"drift={update_row['mean_local_tracking_xy_drift_delta_m']:.3f}m"
+            )
             print(
                 "  reward_terms: "
                 f"time={update_row['mean_reward_time']:.4f}, "
@@ -2129,6 +2704,8 @@ def main():
                 f"moving_velocity={update_row['mean_reward_moving_velocity']:.4f}, "
                 f"moving_good={update_row['mean_reward_moving_good']:.4f}, "
                 f"moving_progress={update_row['mean_reward_moving_progress']:.4f}, "
+                f"local_tracking={update_row['mean_reward_local_tracking']:.4f}, "
+                f"local_drift={update_row['mean_reward_local_drift']:.4f}, "
                 f"stopped_position={update_row['mean_reward_stopped_position']:.4f}, "
                 f"goal_zone={update_row['mean_reward_goal_zone']:.4f}, "
                 f"dwell={update_row['mean_reward_dwell']:.4f}, "
@@ -2151,7 +2728,12 @@ def main():
                 break
     except KeyboardInterrupt:
         print("\n[FAST PPO] interrupted")
-        if policy is not None and actor_optimizer is not None and critic_optimizer is not None:
+        if (
+            not args.evaluation_only
+            and policy is not None
+            and actor_optimizer is not None
+            and critic_optimizer is not None
+        ):
             save_policy_checkpoint(
                 model_dir / "actor_critic_interrupted.pt",
                 policy,
@@ -2160,6 +2742,8 @@ def main():
                 actor_optimizer,
                 critic_optimizer,
                 env._rng if env is not None else None,
+                value_normalizer,
+                reference_policy,
             )
             save_policy_checkpoint(
                 model_dir / "actor_critic.pt",
@@ -2169,6 +2753,8 @@ def main():
                 actor_optimizer,
                 critic_optimizer,
                 env._rng if env is not None else None,
+                value_normalizer,
+                reference_policy,
             )
             print("[FAST PPO] saved interrupted checkpoint")
     except BaseException as exc:

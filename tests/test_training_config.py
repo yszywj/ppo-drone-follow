@@ -66,6 +66,30 @@ class TrainingConfigTest(unittest.TestCase):
         self.assertIn("actor_critic_update_10.pt", args.load_checkpoint)
         self.assertEqual(args.best_checkpoint_window, 5)
 
+    def test_stage7_inherits_baseline_and_overrides_credit_assignment(self) -> None:
+        args = self._parse(
+            "stage7_local_credit_popart_5hz_ratio_5to5_100k_seed7.json"
+        )
+        self.assertEqual(args.seed, 7)
+        self.assertEqual(args.rollout_steps, 256)
+        self.assertEqual(args.policy_ratio, 0.5)
+        self.assertEqual(args.actor_recurrent_mode, "frozen")
+        self.assertTrue(args.use_popart)
+        self.assertAlmostEqual(args.gae_lambda, 0.98)
+        self.assertAlmostEqual(args.reward_local_tracking_scale, 2.0)
+        self.assertAlmostEqual(args.reference_kl_coef, 0.05)
+        self.assertEqual(args.motion_pool_config["min_segments"], 6)
+        self.assertEqual(args.motion_pool_config["max_segments"], 8)
+        self.assertIn("cruise", args.motion_pool_config["primitive_library"])
+
+    def test_fixed_evaluation_is_deterministic_and_does_not_train(self) -> None:
+        args = self._parse("eval_fixed_seed5_best_50k.json")
+        self.assertTrue(args.evaluation_only)
+        self.assertTrue(args.deterministic_actions)
+        self.assertTrue(args.independent_env_rng)
+        self.assertEqual(args.actor_recurrent_mode, "frozen")
+        self.assertEqual(args.best_checkpoint_window, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

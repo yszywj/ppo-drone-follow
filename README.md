@@ -179,6 +179,13 @@ error and vertical-velocity error meet their tighter tolerances. Failure is
 reported as `vertical_success_failed`, and stopped reward is disabled when this
 gate has failed.
 
+An optional primitive-independent local credit signal summarizes the last fixed
+time window (2 seconds in Stage 7). It blends continuous joint quality with the
+minimum XY/velocity/Z good fraction and emits once per configured interval. A
+separate penalty is applied only when XY error has increased beyond a deadband
+across the window. The history is not reset at primitive boundaries, so it also
+applies to continuous random trajectories.
+
 ## JSON training configs
 
 The normal training command now only needs `--config`:
@@ -193,6 +200,8 @@ argument names. A command-line scalar still overrides the config value. Relative
 `results_root` and `load_checkpoint` paths are resolved from the config file.
 An optional `output.task_description` string is copied to `args.json` and printed
 at startup. If the config omits it, the field is omitted from `args.json`.
+Configs may use `"extends": "base.json"`; nested sections are inherited and only
+the listed values are overridden.
 
 Available curriculum configs:
 
@@ -238,14 +247,23 @@ Available curriculum configs:
   reward, removes the raw action-magnitude penalty, keeps a small action-change
   penalty, resets optimizer momentum, and uses separate constant Actor/Critic
   learning rates.
+- `stage7_local_credit_popart_5hz_ratio_5to5_100k_seed7.json`: transfers the
+  seed-5 best Actor, uses six to eight segments, a 256-step rollout and
+  `lambda=0.98`, adds the 2-second local signal, trains the Critic in PopArt
+  normalized units, freezes the transferred GRU branch, and limits cumulative
+  Actor drift with a fixed-reference KL term.
+- `eval_fixed_seed5_best_50k.json`: deterministic no-update evaluation with a
+  fixed per-environment task bank. `ablation/run_fixed_ablation.sh` compares the
+  retained GRU, disabled GRU, wider CTBR roll/pitch limits and helper-only control.
 
-The bridge config sets `allow_partial_checkpoint=true` because the old
-checkpoint contains the removed Actor future-reference branch. The 77-value
-Critic layout and all shared tensor shapes are preserved, so migration should
-report exact shared tensors and only skip the obsolete reference tensors.
+Stage 7 sets `allow_partial_checkpoint=true` because six causal local-window
+statistics were added to the privileged Critic input. Actor tensors remain exact;
+only the added columns of the Critic input layer start from fresh initialization.
 
-New checkpoints include Actor and Critic optimizer states plus Python, NumPy,
-Torch and environment RNG states. A legacy checkpoint has no optimizer state,
+New checkpoints include Actor and Critic optimizer states, PopArt state when
+enabled, the fixed reference-policy anchor when used, plus Python, NumPy, Torch
+and environment RNG states. A legacy
+checkpoint has no optimizer state,
 so the first migrated run intentionally starts new optimizers. Set
 `reset_rng_on_load=true` when a transferred checkpoint should retain optimizer
 state but use the new config's seed and task sampling. Interrupting training
@@ -271,7 +289,9 @@ and the timestamp distinguishes repeated runs. Each run stores:
 - tracking, reward, PPO, outcome, direction/radius and primitive plots
 
 Update metrics include the raw/effective GRU gate, separate backbone/recurrent
-learning rates, and moving/stopped XY, Z, velocity and joint good fractions.
+learning rates, raw return/value statistics, value clipping, reference KL,
+per-axis policy/helper/final CTBR commands and saturation, local-window quality,
+and moving/stopped XY, Z, velocity and joint good fractions.
 Vertical-task rows additionally contain height/vertical-velocity good
 fractions, vertical gate state and per-primitive vertical velocity error.
 Those conditions are also split by primitive in

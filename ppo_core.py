@@ -198,6 +198,47 @@ class ActorCritic(nn.Module):
         )
         return action, next_hidden
 
+    def act_deterministic(
+        self,
+        obs: torch.Tensor,
+        critic_obs: torch.Tensor,
+        hidden_state: torch.Tensor,
+        episode_start: torch.Tensor | None = None,
+    ):
+        features, next_hidden = self._actor_features_step(
+            obs, hidden_state, episode_start
+        )
+        dist = self.distribution_from_features(features)
+        action = torch.clamp(
+            torch.tanh(dist.mean),
+            -1.0 + self.ACTION_EPS,
+            1.0 - self.ACTION_EPS,
+        )
+        log_prob = self._squashed_log_prob(dist, self._atanh(action))
+        return action, log_prob, self.value(critic_obs), next_hidden
+
+    def distribution_parameters_sequence(
+        self,
+        obs: torch.Tensor,
+        initial_hidden: torch.Tensor,
+        episode_starts: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if obs.ndim != 3:
+            raise ValueError(
+                "recurrent observations must have shape (time, batch, obs_dim)"
+            )
+        hidden = initial_hidden
+        means = []
+        stds = []
+        for step in range(obs.shape[0]):
+            features, hidden = self._actor_features_step(
+                obs[step], hidden, episode_starts[step]
+            )
+            dist = self.distribution_from_features(features)
+            means.append(dist.mean)
+            stds.append(dist.stddev)
+        return torch.stack(means), torch.stack(stds), hidden
+
     def evaluate_actions_sequence(
         self,
         obs: torch.Tensor,
@@ -250,6 +291,104 @@ class ActorCritic(nn.Module):
             "recurrent": True,
             "asymmetric_critic": self.critic_obs_dim != self.obs_dim,
         }
+
+
+class PopArtValueNormalizer:
+    """EMA return normalization with value-output preservation."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        beta: float = 0.999,
+        epsilon: float = 1e-5,
+    ) -> None:
+        if not 0.0 <= beta < 1.0:
+            raise ValueError("PopArt beta must be in [0, 1)")
+        if epsilon <= 0.0:
+            raise ValueError("PopArt epsilon must be positive")
+        self.device = device
+        self.beta = float(beta)
+        self.epsilon = float(epsilon)
+        self.mean = torch.zeros((), dtype=torch.float32, device=device)
+        self.second_moment = torch.ones((), dtype=torch.float32, device=device)
+        self.std = torch.ones((), dtype=torch.float32, device=device)
+        self.initialized = False
+        self.num_updates = 0
+
+    def normalize(self, values: torch.Tensor) -> torch.Tensor:
+        return (values - self.mean) / self.std
+
+    def denormalize(self, values: torch.Tensor) -> torch.Tensor:
+        return values * self.std + self.mean
+
+    @torch.no_grad()
+    def update(
+        self,
+        returns: torch.Tensor,
+        output_layer: nn.Linear,
+        optimizer: torch.optim.Optimizer | None = None,
+    ) -> None:
+        finite_returns = returns.detach().reshape(-1)
+        finite_returns = finite_returns[torch.isfinite(finite_returns)]
+        if finite_returns.numel() == 0:
+            return
+        batch_mean = finite_returns.mean()
+        batch_second_moment = torch.square(finite_returns).mean()
+        old_mean = self.mean.clone()
+        old_std = self.std.clone()
+        if self.initialized:
+            new_mean = self.beta * self.mean + (1.0 - self.beta) * batch_mean
+            new_second_moment = (
+                self.beta * self.second_moment
+                + (1.0 - self.beta) * batch_second_moment
+            )
+        else:
+            new_mean = batch_mean
+            new_second_moment = batch_second_moment
+            self.initialized = True
+        new_variance = torch.clamp(
+            new_second_moment - torch.square(new_mean),
+            min=self.epsilon * self.epsilon,
+        )
+        new_std = torch.sqrt(new_variance)
+        scale = old_std / new_std
+        output_layer.weight.mul_(scale)
+        output_layer.bias.copy_(
+            (old_std * output_layer.bias + old_mean - new_mean) / new_std
+        )
+        if optimizer is not None:
+            for parameter in (output_layer.weight, output_layer.bias):
+                state = optimizer.state.get(parameter, {})
+                if "exp_avg" in state:
+                    state["exp_avg"].mul_(scale)
+                if "exp_avg_sq" in state:
+                    state["exp_avg_sq"].mul_(scale * scale)
+        self.mean.copy_(new_mean)
+        self.second_moment.copy_(new_second_moment)
+        self.std.copy_(new_std)
+        self.num_updates += 1
+
+    def state_dict(self) -> dict:
+        return {
+            "beta": self.beta,
+            "epsilon": self.epsilon,
+            "mean": self.mean.detach().cpu(),
+            "second_moment": self.second_moment.detach().cpu(),
+            "std": self.std.detach().cpu(),
+            "initialized": self.initialized,
+            "num_updates": self.num_updates,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        self.beta = float(state.get("beta", self.beta))
+        self.epsilon = float(state.get("epsilon", self.epsilon))
+        self.mean.copy_(torch.as_tensor(state["mean"], device=self.device))
+        self.second_moment.copy_(
+            torch.as_tensor(state["second_moment"], device=self.device)
+        )
+        self.std.copy_(torch.as_tensor(state["std"], device=self.device))
+        self.initialized = bool(state.get("initialized", True))
+        self.num_updates = int(state.get("num_updates", 0))
 
 
 def compute_gae_vec(
@@ -509,6 +648,55 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         plt.close(fig)
 
         fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
+        for key, label in (
+            ("mean_local_tracking_soft_joint_quality", "soft joint"),
+            ("mean_local_tracking_xy_good_fraction", "XY"),
+            ("mean_local_tracking_velocity_good_fraction", "velocity"),
+            ("mean_local_tracking_z_good_fraction", "Z"),
+        ):
+            axes[0].plot(x, [r.get(key, 0.0) for r in update_rows], label=label)
+        axes[0].set_ylabel("local quality")
+        axes[0].legend()
+        axes[1].plot(
+            x,
+            [r.get("mean_local_tracking_xy_drift_delta_m", 0.0) for r in update_rows],
+            label="XY drift",
+        )
+        axes[1].plot(
+            x,
+            [r.get("mean_reward_local_tracking", 0.0) for r in update_rows],
+            label="tracking reward",
+        )
+        axes[1].plot(
+            x,
+            [r.get("mean_reward_local_drift", 0.0) for r in update_rows],
+            label="drift reward",
+        )
+        axes[1].set_ylabel("local credit")
+        axes[1].legend()
+        axes[2].plot(
+            x,
+            [r.get("value_clip_fraction", 0.0) for r in update_rows],
+            label="value clip fraction",
+        )
+        axes[2].plot(
+            x,
+            [r.get("reference_kl", 0.0) for r in update_rows],
+            label="reference KL",
+        )
+        axes[2].plot(
+            x,
+            [r.get("cmd_saturation_fraction", 0.0) for r in update_rows],
+            label="CTBR saturation",
+        )
+        axes[2].set_xlabel("env steps")
+        axes[2].set_ylabel("optimizer/control")
+        axes[2].legend()
+        fig.tight_layout()
+        fig.savefig(plot_dir / "local_credit_and_control.png", dpi=150)
+        plt.close(fig)
+
+        fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
         axes[0].plot(x, [r["mean_reward_progress"] for r in update_rows], label="progress")
         axes[0].plot(x, [r["mean_reward_distance"] for r in update_rows], label="distance")
         axes[0].plot(
@@ -549,6 +737,16 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
             x,
             [r.get("mean_reward_moving_good", 0.0) for r in update_rows],
             label="moving good",
+        )
+        axes[1].plot(
+            x,
+            [r.get("mean_reward_local_tracking", 0.0) for r in update_rows],
+            label="local tracking",
+        )
+        axes[1].plot(
+            x,
+            [r.get("mean_reward_local_drift", 0.0) for r in update_rows],
+            label="local drift",
         )
         axes[1].legend()
         axes[2].plot(x, [r.get("mean_reward_capture", 0.0) for r in update_rows], label="capture")
@@ -1009,6 +1207,16 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         )
         axes[0].plot(x, [r["return_braking"] for r in episode_rows], label="braking")
         axes[0].plot(x, [r.get("return_moving_good", 0.0) for r in episode_rows], label="moving good")
+        axes[0].plot(
+            x,
+            [r.get("return_local_tracking", 0.0) for r in episode_rows],
+            label="local tracking",
+        )
+        axes[0].plot(
+            x,
+            [r.get("return_local_drift", 0.0) for r in episode_rows],
+            label="local drift",
+        )
         axes[0].legend()
         axes[1].plot(
             x,
@@ -1110,7 +1318,14 @@ def restore_training_state(
     critic_optimizer: torch.optim.Optimizer,
     env_rng: np.random.Generator | None = None,
     restore_rng: bool = True,
+    value_normalizer: PopArtValueNormalizer | None = None,
 ) -> bool:
+    normalizer_state = checkpoint_payload.get("value_normalizer_state")
+    if value_normalizer is not None and normalizer_state is not None:
+        value_normalizer.load_state_dict(normalizer_state)
+        print("[FAST PPO] restored PopArt value-normalizer state")
+    elif value_normalizer is not None:
+        print("[FAST PPO] checkpoint has no PopArt state; using identity initialization")
     actor_state = checkpoint_payload.get("actor_optimizer_state")
     critic_state = checkpoint_payload.get("critic_optimizer_state")
     if actor_state is None or critic_state is None:
@@ -1159,10 +1374,12 @@ def save_policy_checkpoint(
     actor_optimizer: torch.optim.Optimizer | None = None,
     critic_optimizer: torch.optim.Optimizer | None = None,
     env_rng: np.random.Generator | None = None,
+    value_normalizer: PopArtValueNormalizer | None = None,
+    reference_policy: ActorCritic | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "format_version": 3,
+        "format_version": 5,
         "state_dict": policy.state_dict(),
         "model_config": policy.model_config(),
         "update": int(update),
@@ -1174,6 +1391,12 @@ def save_policy_checkpoint(
             torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
         ),
         "env_rng_state": env_rng.bit_generator.state if env_rng is not None else None,
+        "value_normalizer_state": (
+            value_normalizer.state_dict() if value_normalizer is not None else None
+        ),
+        "reference_policy_state_dict": (
+            reference_policy.state_dict() if reference_policy is not None else None
+        ),
     }
     if actor_optimizer is not None:
         payload["actor_optimizer_state"] = actor_optimizer.state_dict()
