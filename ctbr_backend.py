@@ -5,9 +5,14 @@ from dataclasses import dataclass, field
 from typing import Optional, Sequence, Tuple
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 
 from pegasus.simulator.logic.backends.backend import Backend, BackendConfig
+
+from .control_geometry import (
+    rotate_world_xy_to_policy_frame,
+    wrap_angle_pi,
+    xy_tracking_attitude_targets,
+)
 
 
 @dataclass
@@ -115,10 +120,6 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, float(value)))
 
 
-def wrap_angle_pi(angle: float) -> float:
-    return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
-
-
 def enu_to_ned(vec: Sequence[float]) -> np.ndarray:
     v = np.asarray(vec, dtype=np.float64)
     return np.array([v[1], v[0], -v[2]], dtype=np.float64)
@@ -134,18 +135,31 @@ def frd_to_flu(vec: Sequence[float]) -> np.ndarray:
     return np.array([v[0], -v[1], -v[2]], dtype=np.float64)
 
 
-def rotate_world_xy_to_policy_frame(
-    x: float,
-    y: float,
+def helper_xy_attitude_targets(
+    position_error_ned_xy: Sequence[float],
+    own_velocity_ned_xy: Sequence[float],
+    target_velocity_ned_xy: Sequence[float],
+    target_acceleration_ned_xy: Sequence[float],
     current_yaw: float,
-    reference_yaw: Optional[float],
+    limits: CTBRActionLimits,
 ) -> Tuple[float, float]:
-    if reference_yaw is None:
-        return float(x), float(y)
-    delta_yaw = wrap_angle_pi(float(current_yaw) - float(reference_yaw))
-    c = math.cos(delta_yaw)
-    s = math.sin(delta_yaw)
-    return c * float(x) + s * float(y), -s * float(x) + c * float(y)
+    goal_feedback_scale = limits.goal_feedback_scale
+    if goal_feedback_scale is None:
+        goal_feedback_scale = limits.pd_feedback_scale
+    return xy_tracking_attitude_targets(
+        position_error_ned_xy,
+        own_velocity_ned_xy,
+        target_velocity_ned_xy,
+        target_acceleration_ned_xy,
+        current_yaw=current_yaw,
+        goal_feedback_scale=float(goal_feedback_scale),
+        position_gain=limits.goal_xy_pos_gain,
+        velocity_damping_gain=limits.xy_velocity_damping_gain,
+        target_velocity_gain=limits.xy_target_velocity_gain,
+        target_acceleration_gain=limits.xy_target_accel_gain,
+        max_tilt_cmd=limits.xy_max_tilt_cmd,
+        control_mode=limits.xy_control_mode,
+    )
 
 
 def map_policy_action_to_ctbr(action: Sequence[float], limits: CTBRActionLimits) -> Tuple[float, float, float, float]:

@@ -8,6 +8,17 @@ from typing import Sequence
 import numpy as np
 
 
+CAMERA_OBSERVATION_NAMES = (
+    "image_u_normalized",
+    "image_v_normalized",
+    "forward_depth_normalized",
+    "range_3d_normalized",
+    "visible",
+    "center_quality",
+)
+CAMERA_OBSERVATION_DIM = len(CAMERA_OBSERVATION_NAMES)
+
+
 @dataclass(frozen=True)
 class CameraModelConfig:
     """Pinhole camera fixed to a vehicle with NED/FRD state conventions.
@@ -58,26 +69,39 @@ class CameraProjection:
     success_region: bool
     center_quality: float
 
-    def actor_features(self, far_clip_m: float) -> np.ndarray:
-        """Return deployable image/range features without success internals."""
-        if self.in_front:
-            u = float(np.clip(self.normalized_u, -2.0, 2.0))
-            v = float(np.clip(self.normalized_v, -2.0, 2.0))
-        else:
-            u = 0.0
-            v = 0.0
-        scale = max(1e-6, float(far_clip_m))
-        return np.asarray(
-            [
-                u,
-                v,
-                float(np.clip(self.camera_x_m / scale, 0.0, 1.0)),
-                float(np.clip(self.range_m / scale, 0.0, 1.0)),
-                float(self.visible),
-                self.center_quality,
-            ],
-            dtype=np.float32,
-        )
+
+def camera_observation_vector(
+    projection: CameraProjection,
+    config: CameraModelConfig,
+) -> np.ndarray:
+    """Build detector-style camera features without exposing raw pixels.
+
+    Horizontal and vertical positions are normalized by the image half-width
+    and half-height. Optical-axis depth and 3-D range are normalized to the
+    configured camera range. An invisible target has zero-valued measurements;
+    the visibility bit disambiguates that case from a centered detection.
+    """
+    if not projection.visible:
+        return np.zeros(CAMERA_OBSERVATION_DIM, dtype=np.float32)
+    depth_span = max(1e-6, float(config.far_clip_m) - float(config.near_clip_m))
+    normalized_depth = (
+        float(projection.camera_x_m) - float(config.near_clip_m)
+    ) / depth_span
+    normalized_range = float(projection.range_m) / max(
+        1e-6,
+        float(config.far_clip_m),
+    )
+    return np.asarray(
+        [
+            np.clip(projection.normalized_u, -1.0, 1.0),
+            np.clip(projection.normalized_v, -1.0, 1.0),
+            np.clip(normalized_depth, 0.0, 1.0),
+            np.clip(normalized_range, 0.0, 1.0),
+            1.0,
+            np.clip(projection.center_quality, 0.0, 1.0),
+        ],
+        dtype=np.float32,
+    )
 
 
 def project_target_to_camera(
@@ -199,6 +223,39 @@ def project_target_to_camera(
         success_region=success_region,
         center_quality=float(center_quality),
     )
+
+
+def camera_centering_yaw_rate(
+    bearing_rad: float,
+    current_yaw_rate_rad_s: float,
+    proportional_gain: float,
+    damping_gain: float,
+    max_rate_rad_s: float,
+    deadband_rad: float = 0.0,
+) -> float:
+    """Return a body-FRD yaw-rate command that centers a target horizontally."""
+    values = (
+        bearing_rad,
+        current_yaw_rate_rad_s,
+        proportional_gain,
+        damping_gain,
+        max_rate_rad_s,
+        deadband_rad,
+    )
+    if not all(math.isfinite(float(value)) for value in values):
+        raise ValueError("camera yaw-helper inputs must be finite")
+    if proportional_gain < 0.0 or damping_gain < 0.0:
+        raise ValueError("camera yaw-helper gains must be non-negative")
+    if max_rate_rad_s < 0.0 or deadband_rad < 0.0:
+        raise ValueError("camera yaw-helper limits must be non-negative")
+    wrapped_bearing = math.atan2(math.sin(bearing_rad), math.cos(bearing_rad))
+    effective_magnitude = max(0.0, abs(wrapped_bearing) - deadband_rad)
+    effective_bearing = math.copysign(effective_magnitude, wrapped_bearing)
+    command = (
+        proportional_gain * effective_bearing
+        - damping_gain * current_yaw_rate_rad_s
+    )
+    return float(np.clip(command, -max_rate_rad_s, max_rate_rad_s))
 
 
 @dataclass(frozen=True)

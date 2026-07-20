@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import csv
+import copy
 import json
 import os
 import random
 import sys
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Any, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -88,6 +89,15 @@ class ActorCritic(nn.Module):
         nn.init.constant_(self.temporal_projection.bias, 0.0)
         nn.init.orthogonal_(self.critic.weight, gain=1.0)
         nn.init.constant_(self.critic.bias, 0.0)
+
+    def reset_actor_output(self, init_std: float) -> None:
+        """Reset the CTBR residual head while preserving actor features and Critic."""
+        if float(init_std) <= 0.0:
+            raise ValueError("actor action standard deviation must be positive")
+        nn.init.orthogonal_(self.actor_mean.weight, gain=0.01)
+        nn.init.constant_(self.actor_mean.bias, 0.0)
+        with torch.no_grad():
+            self.log_std.fill_(float(np.log(init_std)))
 
     def initial_state(self, batch_size: int, device: torch.device | None = None) -> torch.Tensor:
         if device is None:
@@ -1016,8 +1026,15 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
         episode_index = np.arange(1, len(episode_rows) + 1)
         colors = ["tab:green" if r["success"] else "tab:red" for r in episode_rows]
         cumulative_success = np.cumsum(success_flags) / episode_index
+        camera_enabled = bool(run_args.get("camera_tracking_enabled", False))
+        outcome_panel_count = 5 if camera_enabled else 4
 
-        fig, axes = plt.subplots(4, 1, figsize=(12, 17), sharex=True)
+        fig, axes = plt.subplots(
+            outcome_panel_count,
+            1,
+            figsize=(12, 20 if camera_enabled else 17),
+            sharex=True,
+        )
         final_xy = [r["final_goal_xy_err"] for r in episode_rows]
         axes[0].plot(episode_index, final_xy, color="tab:blue", alpha=0.18)
         axes[0].scatter(episode_index, final_xy, c=colors, s=18, label="final goal xy error")
@@ -1070,13 +1087,46 @@ def save_training_plots(run_dir: Path, update_rows: List[dict], episode_rows: Li
             label="stopped speed tolerance",
         )
         axes[3].set_ylabel("final speed xy (m/s)")
-        axes[3].set_xlabel("completed episode")
         axes[3].legend(loc="upper left")
+
+        if camera_enabled:
+            camera_good = [
+                r.get("camera_good_fraction", 0.0) for r in episode_rows
+            ]
+            axes[4].plot(
+                episode_index,
+                [r.get("camera_visible_fraction", 0.0) for r in episode_rows],
+                color="tab:blue",
+                alpha=0.45,
+                label="camera visible fraction",
+            )
+            axes[4].plot(
+                episode_index,
+                camera_good,
+                color="tab:cyan",
+                alpha=0.25,
+            )
+            axes[4].scatter(
+                episode_index,
+                camera_good,
+                c=colors,
+                s=18,
+                label="camera success-region fraction",
+            )
+            axes[4].axhline(
+                float(run_args.get("camera_success_min_fraction", 0.9)),
+                color="tab:red",
+                linestyle="--",
+                label="camera success threshold",
+            )
+            axes[4].set_ylim(0.0, 1.05)
+            axes[4].set_ylabel("camera / heading fraction")
+            axes[4].legend(loc="lower left")
+        axes[-1].set_xlabel("completed episode")
         fig.tight_layout()
         fig.savefig(plot_dir / "episode_outcomes.png", dpi=150)
         plt.close(fig)
 
-        camera_enabled = bool(run_args.get("camera_tracking_enabled", False))
         condition_count = 4 if camera_enabled else 3
         fig, axes = plt.subplots(
             condition_count,
@@ -1554,8 +1604,7 @@ def restore_training_state(
     return True
 
 
-def save_policy_checkpoint(
-    path: Path,
+def _policy_checkpoint_payload(
     policy: ActorCritic,
     update: int,
     total_steps: int,
@@ -1564,9 +1613,8 @@ def save_policy_checkpoint(
     env_rng: np.random.Generator | None = None,
     value_normalizer: PopArtValueNormalizer | None = None,
     reference_policy: ActorCritic | None = None,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "format_version": 5,
         "state_dict": policy.state_dict(),
         "model_config": policy.model_config(),
@@ -1590,7 +1638,80 @@ def save_policy_checkpoint(
         payload["actor_optimizer_state"] = actor_optimizer.state_dict()
     if critic_optimizer is not None:
         payload["critic_optimizer_state"] = critic_optimizer.state_dict()
+    return payload
+
+
+def _freeze_checkpoint_value(value: Any) -> Any:
+    if torch.is_tensor(value):
+        return value.detach().cpu().clone()
+    if isinstance(value, np.ndarray):
+        return value.copy()
+    if isinstance(value, dict):
+        return {
+            _freeze_checkpoint_value(key): _freeze_checkpoint_value(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_freeze_checkpoint_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_freeze_checkpoint_value(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def capture_policy_checkpoint(
+    policy: ActorCritic,
+    update: int,
+    total_steps: int,
+    actor_optimizer: torch.optim.Optimizer | None = None,
+    critic_optimizer: torch.optim.Optimizer | None = None,
+    env_rng: np.random.Generator | None = None,
+    value_normalizer: PopArtValueNormalizer | None = None,
+    reference_policy: ActorCritic | None = None,
+) -> dict[str, Any]:
+    """Freeze the exact policy and training state used to collect a rollout."""
+    return _freeze_checkpoint_value(
+        _policy_checkpoint_payload(
+            policy,
+            update,
+            total_steps,
+            actor_optimizer,
+            critic_optimizer,
+            env_rng,
+            value_normalizer,
+            reference_policy,
+        )
+    )
+
+
+def save_checkpoint_payload(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
+
+
+def save_policy_checkpoint(
+    path: Path,
+    policy: ActorCritic,
+    update: int,
+    total_steps: int,
+    actor_optimizer: torch.optim.Optimizer | None = None,
+    critic_optimizer: torch.optim.Optimizer | None = None,
+    env_rng: np.random.Generator | None = None,
+    value_normalizer: PopArtValueNormalizer | None = None,
+    reference_policy: ActorCritic | None = None,
+) -> None:
+    save_checkpoint_payload(
+        path,
+        _policy_checkpoint_payload(
+            policy,
+            update,
+            total_steps,
+            actor_optimizer,
+            critic_optimizer,
+            env_rng,
+            value_normalizer,
+            reference_policy,
+        ),
+    )
 
 
 def dump_json(path: Path, data: dict) -> None:

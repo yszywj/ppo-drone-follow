@@ -11,6 +11,7 @@ import torch
 from pegasus_iris_fast_line_follow.ppo_core import (
     ActorCritic,
     PopArtValueNormalizer,
+    capture_policy_checkpoint,
     load_transplanted_checkpoint,
     restore_training_state,
     save_policy_checkpoint,
@@ -75,6 +76,41 @@ class RecurrentActorCriticTest(unittest.TestCase):
         recurrent_grad = self.policy.actor_gru.weight_ih.grad
         self.assertIsNotNone(recurrent_grad)
         self.assertGreater(float(recurrent_grad.abs().sum()), 0.0)
+
+    def test_actor_output_reset_preserves_features_and_critic(self) -> None:
+        preserved = {
+            key: value.detach().clone()
+            for key, value in self.policy.state_dict().items()
+            if key not in {"actor_mean.weight", "actor_mean.bias", "log_std"}
+        }
+        with torch.no_grad():
+            self.policy.actor_mean.weight.fill_(1.0)
+            self.policy.actor_mean.bias.fill_(1.0)
+            self.policy.log_std.zero_()
+
+        self.policy.reset_actor_output(0.12)
+
+        self.assertTrue(
+            torch.allclose(
+                self.policy.actor_mean.bias,
+                torch.zeros_like(self.policy.actor_mean.bias),
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                self.policy.log_std,
+                torch.full_like(self.policy.log_std, float(np.log(0.12))),
+            )
+        )
+        self.assertFalse(
+            torch.allclose(
+                self.policy.actor_mean.weight,
+                torch.ones_like(self.policy.actor_mean.weight),
+            )
+        )
+        current = self.policy.state_dict()
+        for key, expected in preserved.items():
+            self.assertTrue(torch.equal(current[key], expected), key)
 
     def test_checkpoint_round_trip_restores_optimizers(self) -> None:
         actor_optimizer = torch.optim.Adam(list(self.policy.actor_parameters()), lr=1e-4)
@@ -154,6 +190,35 @@ class RecurrentActorCriticTest(unittest.TestCase):
                 int(expected_rng.integers(0, 1_000_000)),
             )
 
+    def test_captured_checkpoint_is_not_changed_by_next_update(self) -> None:
+        actor_optimizer = torch.optim.Adam(
+            list(self.policy.actor_parameters()),
+            lr=1e-4,
+        )
+        critic_optimizer = torch.optim.Adam(
+            list(self.policy.critic_parameters()),
+            lr=2e-4,
+        )
+        payload = capture_policy_checkpoint(
+            self.policy,
+            update=4,
+            total_steps=2048,
+            actor_optimizer=actor_optimizer,
+            critic_optimizer=critic_optimizer,
+        )
+        captured_bias = payload["state_dict"]["actor_mean.bias"].clone()
+        with torch.no_grad():
+            self.policy.actor_mean.bias.add_(0.5)
+        self.assertTrue(
+            torch.allclose(
+                payload["state_dict"]["actor_mean.bias"],
+                captured_bias,
+            )
+        )
+        self.assertFalse(
+            torch.allclose(self.policy.actor_mean.bias, captured_bias)
+        )
+
     def test_partial_load_skips_removed_actor_reference_branch(self) -> None:
         with TemporaryDirectory() as directory:
             checkpoint = Path(directory) / "legacy_checkpoint.pt"
@@ -186,7 +251,7 @@ class RecurrentActorCriticTest(unittest.TestCase):
             restored = ActorCritic(
                 obs_dim=38,
                 action_dim=4,
-                critic_obs_dim=95,
+                critic_obs_dim=89,
                 actor_hidden_sizes=(64, 32),
                 critic_hidden_sizes=(64, 32),
                 recurrent_hidden_size=32,
@@ -202,7 +267,7 @@ class RecurrentActorCriticTest(unittest.TestCase):
                 torch.allclose(restored.actor_body[0].weight[:, 32:], torch.zeros(64, 6))
             )
             self.assertTrue(
-                torch.allclose(restored.critic_body[0].weight[:, 83:], torch.zeros(64, 12))
+                torch.allclose(restored.critic_body[0].weight[:, 83:], torch.zeros(64, 6))
             )
             old_obs = torch.randn(3, 32)
             new_obs = torch.cat((old_obs, torch.randn(3, 6)), dim=1)
@@ -212,7 +277,7 @@ class RecurrentActorCriticTest(unittest.TestCase):
             self.assertTrue(torch.allclose(old_action, new_action, atol=1e-7))
             old_critic_obs = torch.randn(3, 83)
             new_critic_obs = torch.cat(
-                (old_critic_obs, torch.randn(3, 12)), dim=1
+                (old_critic_obs, torch.randn(3, 6)), dim=1
             )
             self.assertTrue(
                 torch.allclose(

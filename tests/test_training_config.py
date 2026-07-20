@@ -91,6 +91,15 @@ class TrainingConfigTest(unittest.TestCase):
         self.assertEqual(args.episode_length, 320)
         self.assertEqual(args.actor_recurrent_mode, "train")
         self.assertTrue(args.camera_tracking_enabled)
+        self.assertTrue(args.allow_partial_checkpoint)
+        self.assertAlmostEqual(args.camera_yaw_helper_kp, 1.0)
+        self.assertAlmostEqual(args.camera_yaw_helper_kd, 0.15)
+        self.assertAlmostEqual(args.camera_yaw_helper_max_rate_rad_s, 0.6)
+        self.assertAlmostEqual(args.camera_yaw_helper_deadband_deg, 2.0)
+        self.assertAlmostEqual(args.attitude_feedback_scale, 2.0)
+        self.assertAlmostEqual(args.xy_velocity_damping_gain, 0.18)
+        self.assertAlmostEqual(args.xy_target_velocity_gain, 0.18)
+        self.assertAlmostEqual(args.xy_target_accel_gain, 0.102)
         self.assertAlmostEqual(args.tracking_xy_tolerance_m, 0.3)
         self.assertAlmostEqual(args.moving_success_xy_tolerance_m, 0.3)
         self.assertAlmostEqual(args.tracking_z_tolerance_m, 0.3)
@@ -103,6 +112,83 @@ class TrainingConfigTest(unittest.TestCase):
         self.assertAlmostEqual(turn["min_heading_change_deg"], 35.0)
         self.assertAlmostEqual(climb["min_vertical_displacement_m"], 0.6)
         self.assertEqual(args.best_checkpoint_min_episodes, 24)
+
+    def test_stage8_500k_preserves_camera_curriculum_and_seed(self) -> None:
+        args = self._parse(
+            "stage8_camera_short_high_amplitude_5hz_ratio_5to5_500k_seed8.json"
+        )
+        self.assertEqual(args.seed, 8)
+        self.assertEqual(args.num_env_steps, 500000)
+        self.assertEqual(args.policy_ratio, 0.5)
+        self.assertTrue(args.camera_tracking_enabled)
+        self.assertTrue(args.allow_partial_checkpoint)
+        self.assertIn("seed7_20260719_154139", args.load_checkpoint)
+
+    def test_stage9_resets_actor_output_and_correlates_global_yaw(self) -> None:
+        args = self._parse(
+            "stage9_global_yaw_visible_bridge_5hz_ratio_8to2_100k_seed9.json"
+        )
+        self.assertEqual(args.seed, 9)
+        self.assertEqual(args.num_env_steps, 100000)
+        self.assertAlmostEqual(args.policy_ratio, 0.2)
+        self.assertTrue(args.reset_actor_output_on_load)
+        self.assertFalse(args.allow_partial_checkpoint)
+        self.assertEqual(args.early_stop_patience_updates, 0)
+        self.assertAlmostEqual(args.lr, 1e-5)
+        self.assertAlmostEqual(args.reference_kl_coef, 0.0)
+        self.assertTrue(args.align_initial_yaw_to_line)
+        self.assertAlmostEqual(args.line_yaw_min_deg, -180.0)
+        self.assertAlmostEqual(args.line_yaw_max_deg, 180.0)
+        self.assertAlmostEqual(args.initial_camera_bearing_min_deg, -40.0)
+        self.assertAlmostEqual(args.initial_camera_bearing_max_deg, 40.0)
+        self.assertEqual(args.motion_pool_config["prefix_ids"], ["accelerate"])
+        self.assertEqual(args.motion_pool_config["required_ids"], ["turn"])
+        self.assertEqual(args.motion_pool_config["required_one_of_ids"], [])
+        self.assertEqual(args.motion_pool_config["min_segments"], 1)
+        self.assertEqual(args.motion_pool_config["max_segments"], 2)
+        self.assertIn("seed8_20260720_005211", args.load_checkpoint)
+
+    def test_stage10_preserves_policy_for_7_to_3_handoff(self) -> None:
+        args = self._parse(
+            "stage10_global_yaw_visible_bridge_5hz_ratio_7to3_64k_seed10.json"
+        )
+        self.assertEqual(args.seed, 10)
+        self.assertEqual(args.num_env_steps, 65536)
+        self.assertAlmostEqual(args.policy_ratio, 0.3)
+        self.assertFalse(args.reset_optimizer)
+        self.assertFalse(args.reset_actor_output_on_load)
+        self.assertIn("seed9_20260720_103119", args.load_checkpoint)
+
+    def test_stage11_preserves_policy_for_6_to_4_handoff(self) -> None:
+        args = self._parse(
+            "stage11_global_yaw_visible_bridge_5hz_ratio_6to4_64k_seed11.json"
+        )
+        self.assertEqual(args.seed, 11)
+        self.assertEqual(args.num_env_steps, 65536)
+        self.assertAlmostEqual(args.policy_ratio, 0.4)
+        self.assertFalse(args.reset_optimizer)
+        self.assertFalse(args.reset_actor_output_on_load)
+        self.assertIn("seed10_20260720_120604", args.load_checkpoint)
+        self.assertIn("actor_critic_update_4.pt", args.load_checkpoint)
+
+    def test_full_helper_short_evaluation_has_zero_policy_mix(self) -> None:
+        args = self._parse("eval_stage8_full_helper_short.json")
+        self.assertTrue(args.evaluation_only)
+        self.assertTrue(args.deterministic_actions)
+        self.assertTrue(args.from_scratch)
+        self.assertEqual(args.num_env_steps, 20480)
+        self.assertEqual(args.rollout_steps, 320)
+        self.assertEqual(args.policy_ratio, 0.0)
+        self.assertEqual(args.best_checkpoint_window, 0)
+        self.assertEqual(Path(args.results_root).name, "controller_helper_test")
+
+    def test_full_helper_v2_is_a_paired_seed80_evaluation(self) -> None:
+        args = self._parse("eval_stage8_full_helper_v2_short.json")
+        self.assertTrue(args.evaluation_only)
+        self.assertEqual(args.seed, 80)
+        self.assertEqual(args.policy_ratio, 0.0)
+        self.assertAlmostEqual(args.attitude_feedback_scale, 2.0)
+        self.assertAlmostEqual(args.xy_velocity_damping_gain, 0.18)
 
     def test_fixed_evaluation_is_deterministic_and_does_not_train(self) -> None:
         args = self._parse("eval_fixed_seed5_best_50k.json")

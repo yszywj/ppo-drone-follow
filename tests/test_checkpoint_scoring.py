@@ -62,6 +62,51 @@ class CheckpointScoringTest(unittest.TestCase):
         self.assertAlmostEqual(components["overall_success"], 0.2)
         self.assertAlmostEqual(components["timeout_rate"], 0.8)
 
+    def test_phase_quality_is_weighted_by_underlying_samples(self) -> None:
+        config = CheckpointScoreConfig(0.3, camera_enabled=True)
+        _, components = aggregate_checkpoint_score(
+            [
+                self.row(
+                    moving_good_sample_fraction=1.0,
+                    moving_xy_good_sample_fraction=1.0,
+                    moving_eligible_sample_count=10,
+                    stopped_xy_zone_fraction=1.0,
+                    stopped_position_zone_fraction=1.0,
+                    stopped_stationary_fraction=1.0,
+                    stopped_sample_count=10,
+                    camera_good_sample_fraction=1.0,
+                    camera_sample_count=10,
+                    primitive_good_fraction=json.dumps({"final_stop": 1.0}),
+                    final_stop_sample_count=10,
+                ),
+                self.row(
+                    moving_good_sample_fraction=0.0,
+                    moving_xy_good_sample_fraction=0.0,
+                    moving_eligible_sample_count=1000,
+                    stopped_xy_zone_fraction=0.0,
+                    stopped_position_zone_fraction=0.0,
+                    stopped_stationary_fraction=0.0,
+                    stopped_sample_count=1000,
+                    camera_good_sample_fraction=0.0,
+                    camera_sample_count=1000,
+                    primitive_good_fraction=json.dumps({"final_stop": 0.0}),
+                    final_stop_sample_count=1000,
+                ),
+            ],
+            config,
+        )
+        expected = 10.0 / 1010.0
+        for key in (
+            "moving_joint",
+            "moving_xy",
+            "stopped_xy",
+            "stopped_position",
+            "stopped_stationary",
+            "final_stop",
+            "camera_visibility",
+        ):
+            self.assertAlmostEqual(components[key], expected)
+
     def test_guardrail_rejects_stopped_regression(self) -> None:
         config = CheckpointScoreConfig(0.3, camera_enabled=True, guardrail_drop=0.08)
         incumbent = {

@@ -110,6 +110,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--randomize_line_yaw", action="store_true", default=False)
     parser.add_argument("--line_yaw_min_deg", type=float, default=-20.0)
     parser.add_argument("--line_yaw_max_deg", type=float, default=20.0)
+    parser.add_argument(
+        "--align_initial_yaw_to_line",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--initial_camera_bearing_min_deg",
+        type=float,
+        default=-40.0,
+    )
+    parser.add_argument(
+        "--initial_camera_bearing_max_deg",
+        type=float,
+        default=40.0,
+    )
 
     parser.add_argument("--tracking_xy_tolerance_m", type=float, default=0.45)
     parser.add_argument("--tracking_z_tolerance_m", type=float, default=0.40)
@@ -423,6 +438,9 @@ def make_configs(args):
         randomize_line_yaw=args.randomize_line_yaw,
         line_yaw_min_deg=args.line_yaw_min_deg,
         line_yaw_max_deg=args.line_yaw_max_deg,
+        align_initial_yaw_to_line=args.align_initial_yaw_to_line,
+        initial_camera_bearing_min_deg=args.initial_camera_bearing_min_deg,
+        initial_camera_bearing_max_deg=args.initial_camera_bearing_max_deg,
         tracking_xy_tolerance_m=args.tracking_xy_tolerance_m,
         tracking_z_tolerance_m=args.tracking_z_tolerance_m,
         tracking_velocity_tolerance_mps=args.tracking_velocity_tolerance_mps,

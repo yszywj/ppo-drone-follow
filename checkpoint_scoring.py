@@ -37,9 +37,28 @@ GUARDRAIL_COMPONENTS = (
 )
 
 
-def _mean(rows: Sequence[Mapping[str, object]], key: str) -> float:
-    values = [float(row.get(key, 0.0)) for row in rows]
-    return sum(values) / float(len(values)) if values else 0.0
+def _sample_weight(row: Mapping[str, object], count_key: str) -> float:
+    if count_key not in row:
+        return 1.0
+    try:
+        value = float(row[count_key])
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) and value > 0.0 else 0.0
+
+
+def _weighted_mean(
+    rows: Sequence[Mapping[str, object]],
+    key: str,
+    count_key: str,
+) -> float:
+    weighted_sum = 0.0
+    total_weight = 0.0
+    for row in rows:
+        weight = _sample_weight(row, count_key)
+        weighted_sum += float(row.get(key, 0.0)) * weight
+        total_weight += weight
+    return weighted_sum / total_weight if total_weight > 0.0 else 0.0
 
 
 def _primitive_fraction(row: Mapping[str, object], primitive_id: str) -> float:
@@ -52,6 +71,43 @@ def _primitive_fraction(row: Mapping[str, object], primitive_id: str) -> float:
     if not isinstance(value, Mapping):
         return 0.0
     return float(value.get(primitive_id, 0.0))
+
+
+def _primitive_sample_count(
+    row: Mapping[str, object],
+    primitive_id: str,
+) -> float:
+    explicit_key = f"{primitive_id}_sample_count"
+    if explicit_key in row:
+        return _sample_weight(row, explicit_key)
+    value = row.get("primitive_sample_counts")
+    if value is None:
+        return 1.0
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return 0.0
+    if not isinstance(value, Mapping):
+        return 0.0
+    try:
+        count = float(value.get(primitive_id, 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    return count if math.isfinite(count) and count > 0.0 else 0.0
+
+
+def _weighted_primitive_fraction(
+    rows: Sequence[Mapping[str, object]],
+    primitive_id: str,
+) -> float:
+    weighted_sum = 0.0
+    total_weight = 0.0
+    for row in rows:
+        weight = _primitive_sample_count(row, primitive_id)
+        weighted_sum += _primitive_fraction(row, primitive_id) * weight
+        total_weight += weight
+    return weighted_sum / total_weight if total_weight > 0.0 else 0.0
 
 
 def aggregate_checkpoint_score(
@@ -84,20 +140,43 @@ def aggregate_checkpoint_score(
         else 0.0
     )
     camera_visibility = (
-        _mean(rows, "camera_good_sample_fraction")
+        _weighted_mean(
+            rows,
+            "camera_good_sample_fraction",
+            "camera_sample_count",
+        )
         if config.camera_enabled
         else 1.0
     )
     components = {
         "completed_episodes": float(completed),
-        "moving_joint": _mean(rows, "moving_good_sample_fraction"),
-        "moving_xy": _mean(rows, "moving_xy_good_sample_fraction"),
+        "moving_joint": _weighted_mean(
+            rows,
+            "moving_good_sample_fraction",
+            "moving_eligible_sample_count",
+        ),
+        "moving_xy": _weighted_mean(
+            rows,
+            "moving_xy_good_sample_fraction",
+            "moving_eligible_sample_count",
+        ),
         "overall_success": successes / outcome_denominator,
-        "stopped_xy": _mean(rows, "stopped_xy_zone_fraction"),
-        "stopped_position": _mean(rows, "stopped_position_zone_fraction"),
-        "stopped_stationary": _mean(rows, "stopped_stationary_fraction"),
-        "final_stop": sum(_primitive_fraction(row, "final_stop") for row in rows)
-        / float(len(rows)),
+        "stopped_xy": _weighted_mean(
+            rows,
+            "stopped_xy_zone_fraction",
+            "stopped_sample_count",
+        ),
+        "stopped_position": _weighted_mean(
+            rows,
+            "stopped_position_zone_fraction",
+            "stopped_sample_count",
+        ),
+        "stopped_stationary": _weighted_mean(
+            rows,
+            "stopped_stationary_fraction",
+            "stopped_sample_count",
+        ),
+        "final_stop": _weighted_primitive_fraction(rows, "final_stop"),
         "mean_final_xy_error_m": float(mean_final_xy),
         "final_xy_quality": float(final_xy_quality),
         "camera_visibility": float(camera_visibility),

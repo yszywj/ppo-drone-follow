@@ -19,10 +19,18 @@ from pegasus.simulator.logic.vehicles.multirotor import Multirotor, MultirotorCo
 from pegasus.simulator.params import ROBOTS, SIMULATION_ENVIRONMENTS
 
 from .camera_geometry import (
+    CAMERA_OBSERVATION_DIM,
     CameraModelConfig,
     CameraProjection,
     CameraQualityWindow,
+    camera_centering_yaw_rate,
+    camera_observation_vector,
     project_target_to_camera,
+)
+from .control_geometry import (
+    mix_ctbr_commands,
+    quaternion_ned_frd_to_euler,
+    vehicle_yaw_for_target_bearing,
 )
 from .ctbr_backend import (
     CTBRActionLimits,
@@ -36,6 +44,7 @@ from .ctbr_backend import (
     enu_to_ned,
     future_reference_vector,
     goal_distance,
+    helper_xy_attitude_targets,
     map_policy_action_to_ctbr,
     ned_to_enu,
     observation_vector,
@@ -110,6 +119,9 @@ class LineFollowTaskConfig:
     randomize_line_yaw: bool = False
     line_yaw_min_deg: float = -20.0
     line_yaw_max_deg: float = 20.0
+    align_initial_yaw_to_line: bool = False
+    initial_camera_bearing_min_deg: float = -40.0
+    initial_camera_bearing_max_deg: float = 40.0
     tracking_xy_tolerance_m: float = 0.30
     tracking_z_tolerance_m: float = 0.30
     tracking_velocity_tolerance_mps: float = 0.45
@@ -163,6 +175,10 @@ class LineFollowTaskConfig:
     reward_camera_visible_scale: float = 0.0
     reward_camera_lost_scale: float = 0.0
     reward_camera_local_scale: float = 0.0
+    camera_yaw_helper_kp: float = 1.0
+    camera_yaw_helper_kd: float = 0.15
+    camera_yaw_helper_max_rate_rad_s: float = 0.60
+    camera_yaw_helper_deadband_deg: float = 2.0
     max_tracking_error_m: float = 3.0
     min_target_distance_m: float = 0.35
     reward_position_scale: float = 2.0
@@ -225,7 +241,6 @@ class FastIrisLineFollowVecEnv:
     """Pegasus Iris vector environment for line following without PX4/MAVLink."""
 
     base_obs_dim = 32
-    camera_obs_dim = 6
     action_dim = 4
 
     def __init__(self, config: FastLineFollowEnvConfig, task_config: LineFollowTaskConfig):
@@ -234,9 +249,10 @@ class FastIrisLineFollowVecEnv:
         self.num_envs = int(config.num_envs)
         self.reference_horizon_sec = tuple(task_config.motion_pool.reference_horizon_sec)
         self.future_reference_dim = 3 * len(self.reference_horizon_sec)
-        self.obs_dim = self.base_obs_dim + (
-            self.camera_obs_dim if task_config.camera_tracking_enabled else 0
+        self.camera_obs_dim = (
+            CAMERA_OBSERVATION_DIM if task_config.camera_tracking_enabled else 0
         )
+        self.obs_dim = self.base_obs_dim + self.camera_obs_dim
         self.local_tracking_privileged_dim = 6
         self.base_privileged_obs_dim = (
             4
@@ -244,12 +260,7 @@ class FastIrisLineFollowVecEnv:
             + 16
             + self.local_tracking_privileged_dim
         )
-        self.camera_privileged_obs_dim = (
-            6 if task_config.camera_tracking_enabled else 0
-        )
-        self.privileged_obs_dim = (
-            self.base_privileged_obs_dim + self.camera_privileged_obs_dim
-        )
+        self.privileged_obs_dim = self.base_privileged_obs_dim
         self.critic_obs_dim = (
             self.obs_dim + self.future_reference_dim + self.privileged_obs_dim
         )
@@ -420,6 +431,10 @@ class FastIrisLineFollowVecEnv:
         self._stopped_speed_good = np.zeros(self.num_envs, dtype=bool)
         self._moving_success_met = np.zeros(self.num_envs, dtype=bool)
         self._line_dir = np.tile(np.array([[1.0, 0.0]], dtype=np.float64), (self.num_envs, 1))
+        self._initial_camera_bearing_deg = np.zeros(
+            self.num_envs,
+            dtype=np.float64,
+        )
         self._line_length_m = np.full(
             self.num_envs,
             max(0.0, float(task_config.line_length_m)),
@@ -478,6 +493,7 @@ class FastIrisLineFollowVecEnv:
         self._last_command_saturated = np.zeros(
             (self.num_envs, self.action_dim), dtype=bool
         )
+        self._last_helper_rate_limited = np.zeros((self.num_envs, 2), dtype=bool)
         self._motion_generator = (
             MotionTaskGenerator(
                 task_config.motion_pool,
@@ -670,6 +686,7 @@ class FastIrisLineFollowVecEnv:
         self._last_controller_command[env_id, :] = safe_command
         self._last_unclipped_command[env_id, :] = safe_command
         self._last_command_saturated[env_id, :] = False
+        self._last_helper_rate_limited[env_id, :] = False
         self._primitive_id[env_id] = "capture"
         self._primitive_code[env_id] = PRIMITIVE_CODES["capture"]
         self._primitive_segment_index[env_id] = 0
@@ -681,9 +698,29 @@ class FastIrisLineFollowVecEnv:
         self._last_reward_terms[env_id] = {key: 0.0 for key in REWARD_TERM_KEYS}
 
         yaw_ned = 0.0
+        line_yaw_override: Optional[float] = None
         self._policy_yaw_reference[env_id] = None
         self._yaw_target[env_id] = None
-        if self.config.randomize_yaw_on_reset:
+        if self.task_config.align_initial_yaw_to_line:
+            rng = self._rng_for_env(env_id)
+            line_yaw_override = self._sample_line_yaw_rad(env_id)
+            bearing_min = float(
+                self.task_config.initial_camera_bearing_min_deg
+            )
+            bearing_max = float(
+                self.task_config.initial_camera_bearing_max_deg
+            )
+            bearing_deg = (
+                bearing_min
+                if abs(bearing_max - bearing_min) <= 1e-12
+                else float(rng.uniform(bearing_min, bearing_max))
+            )
+            yaw_ned = vehicle_yaw_for_target_bearing(
+                line_yaw_override,
+                math.radians(bearing_deg),
+            )
+            self._initial_camera_bearing_deg[env_id] = bearing_deg
+        elif self.config.randomize_yaw_on_reset:
             max_offset = math.radians(max(0.0, min(180.0, self.config.random_yaw_max_offset_deg)))
             yaw_ned = float(self._rng_for_env(env_id).uniform(-max_offset, max_offset))
             self._policy_yaw_reference[env_id] = 0.0
@@ -694,9 +731,17 @@ class FastIrisLineFollowVecEnv:
         self.backends[env_id].reset()
         self.backends[env_id].set_safe_command()
         if self._motion_generator is None:
-            self._sample_line_goal(env_id)
+            self._sample_line_goal(env_id, line_yaw_override)
         else:
-            self._sample_motion_task(env_id)
+            self._sample_motion_task(env_id, line_yaw_override)
+        if line_yaw_override is None:
+            line_yaw = math.atan2(
+                self._line_dir[env_id, 1],
+                self._line_dir[env_id, 0],
+            )
+            self._initial_camera_bearing_deg[env_id] = math.degrees(
+                wrap_angle_pi(line_yaw - yaw_ned)
+            )
         self._previous_target_vel_ned[env_id] = self._target_vel_ned[env_id]
         obs = self._obs_data(env_id)
         self._episode_start_yaw[env_id] = obs.yaw
@@ -731,7 +776,7 @@ class FastIrisLineFollowVecEnv:
             return self._env_rngs[env_id]
         return self._rng
 
-    def _sample_line_goal(self, env_id: int) -> None:
+    def _sample_line_yaw_rad(self, env_id: int) -> float:
         task = self.task_config
         rng = self._rng_for_env(env_id)
         yaw_deg = (
@@ -739,7 +784,20 @@ class FastIrisLineFollowVecEnv:
             if task.randomize_line_yaw
             else task.line_yaw_deg
         )
-        yaw = math.radians(float(yaw_deg))
+        return wrap_angle_pi(math.radians(float(yaw_deg)))
+
+    def _sample_line_goal(
+        self,
+        env_id: int,
+        line_yaw_override: Optional[float] = None,
+    ) -> None:
+        task = self.task_config
+        rng = self._rng_for_env(env_id)
+        yaw = (
+            self._sample_line_yaw_rad(env_id)
+            if line_yaw_override is None
+            else float(line_yaw_override)
+        )
         self._line_dir[env_id] = [math.cos(yaw), math.sin(yaw)]
         if task.randomize_line_length:
             min_length = max(0.0, float(task.line_length_min_m))
@@ -769,15 +827,18 @@ class FastIrisLineFollowVecEnv:
         self._compute_motion_profile(env_id)
         self._sync_goal_to_target(env_id)
 
-    def _sample_motion_task(self, env_id: int) -> None:
+    def _sample_motion_task(
+        self,
+        env_id: int,
+        line_yaw_override: Optional[float] = None,
+    ) -> None:
         task = self.task_config
         rng = self._rng_for_env(env_id)
-        yaw_deg = (
-            rng.uniform(task.line_yaw_min_deg, task.line_yaw_max_deg)
-            if task.randomize_line_yaw
-            else task.line_yaw_deg
+        yaw = (
+            self._sample_line_yaw_rad(env_id)
+            if line_yaw_override is None
+            else float(line_yaw_override)
         )
-        yaw = math.radians(float(yaw_deg))
         self._line_dir[env_id] = [math.cos(yaw), math.sin(yaw)]
         home = self._home[env_id]
         trajectory = self._motion_generator.sample(
@@ -1102,62 +1163,46 @@ class FastIrisLineFollowVecEnv:
         x_err = float(obs.x) - goal.x
         y_err = float(obs.y) - goal.y
         z_err = float(obs.z) - goal.z
-        # The helper emits body-rate commands, so its world-frame tracking
-        # vectors must always be expressed in the current body heading.
-        x_err, y_err = rotate_world_xy_to_policy_frame(
-            x_err, y_err, obs.yaw, 0.0
-        )
-        vx, vy = rotate_world_xy_to_policy_frame(obs.vx, obs.vy, obs.yaw, 0.0)
-        target_vx, target_vy = rotate_world_xy_to_policy_frame(
-            self._goal_vel_ned[env_id, 0],
-            self._goal_vel_ned[env_id, 1],
-            obs.yaw,
-            0.0,
-        )
-        target_ax, target_ay = rotate_world_xy_to_policy_frame(
-            self._goal_accel_ned[env_id, 0],
-            self._goal_accel_ned[env_id, 1],
-            obs.yaw,
-            0.0,
-        )
         vz = float(obs.vz)
         target_vz = float(self._goal_vel_ned[env_id, 2])
         target_az = float(self._goal_accel_ned[env_id, 2])
 
-        goal_feedback_scale = limits.goal_feedback_scale
-        if goal_feedback_scale is None:
-            goal_feedback_scale = limits.pd_feedback_scale
-        x_tilt_term = (
-            goal_feedback_scale * limits.goal_xy_pos_gain * x_err
-            + limits.xy_velocity_damping_gain * vx
-            - limits.xy_target_velocity_gain * target_vx
-            - limits.xy_target_accel_gain * target_ax
+        roll_des, pitch_des = helper_xy_attitude_targets(
+            [x_err, y_err],
+            [obs.vx, obs.vy],
+            self._goal_vel_ned[env_id, :2],
+            self._goal_accel_ned[env_id, :2],
+            obs.yaw,
+            limits,
         )
-        y_tilt_term = (
-            goal_feedback_scale * limits.goal_xy_pos_gain * y_err
-            + limits.xy_velocity_damping_gain * vy
-            - limits.xy_target_velocity_gain * target_vy
-            - limits.xy_target_accel_gain * target_ay
+        controller_pitch_raw = limits.attitude_feedback_scale * (
+            pitch_des - float(obs.pitch)
         )
-        if limits.xy_control_mode == "legacy":
-            roll_des = clamp(x_tilt_term, -limits.xy_max_tilt_cmd, limits.xy_max_tilt_cmd)
-            pitch_des = clamp(y_tilt_term, -limits.xy_max_tilt_cmd, limits.xy_max_tilt_cmd)
-        else:
-            pitch_des = clamp(x_tilt_term, -limits.xy_max_tilt_cmd, limits.xy_max_tilt_cmd)
-            roll_des = clamp(-y_tilt_term, -limits.xy_max_tilt_cmd, limits.xy_max_tilt_cmd)
-        kp_att = 1.0
-        max_feedback_rate = min(0.080, limits.max_roll_rate, limits.max_pitch_rate)
-        pitch_fb = clamp(kp_att * (pitch_des - float(obs.pitch)), -max_feedback_rate, max_feedback_rate)
-        roll_fb = clamp(kp_att * (roll_des - float(obs.roll)), -max_feedback_rate, max_feedback_rate)
-        controller_pitch_raw = limits.attitude_feedback_scale * pitch_fb
-        controller_roll_raw = limits.attitude_feedback_scale * roll_fb
+        controller_roll_raw = limits.attitude_feedback_scale * (
+            roll_des - float(obs.roll)
+        )
+        self._last_helper_rate_limited[env_id] = [
+            abs(controller_roll_raw) > limits.max_roll_rate + 1e-7,
+            abs(controller_pitch_raw) > limits.max_pitch_rate + 1e-7,
+        ]
 
         yaw_target = self._yaw_target[env_id]
-        if (
-            self.task_config.camera_tracking_enabled
-            or yaw_target is None
-            or limits.yaw_hold_kp <= 0.0
-        ):
+        if self.task_config.camera_tracking_enabled:
+            camera_projection = self._project_camera_target(env_id, obs)
+            controller_yaw = camera_centering_yaw_rate(
+                camera_projection.bearing_rad,
+                float(obs.yawspeed),
+                self.task_config.camera_yaw_helper_kp,
+                self.task_config.camera_yaw_helper_kd,
+                min(
+                    self.task_config.camera_yaw_helper_max_rate_rad_s,
+                    limits.max_yaw_rate,
+                ),
+                math.radians(
+                    self.task_config.camera_yaw_helper_deadband_deg
+                ),
+            )
+        elif yaw_target is None or limits.yaw_hold_kp <= 0.0:
             controller_yaw = 0.0
         else:
             yaw_error = wrap_angle_pi(yaw_target - float(obs.yaw))
@@ -1181,7 +1226,6 @@ class FastIrisLineFollowVecEnv:
 
         if limits.control_mix_mode == "ratio":
             policy_ratio = clamp(limits.policy_ratio, 0.0, 1.0)
-            controller_ratio = 1.0 - policy_ratio
             controller_roll = clamp(
                 controller_roll_raw,
                 -limits.max_roll_rate,
@@ -1206,10 +1250,11 @@ class FastIrisLineFollowVecEnv:
                 ],
                 dtype=np.float32,
             )
-            roll = controller_ratio * controller_roll + policy_ratio * pol_roll
-            pitch = controller_ratio * controller_pitch + policy_ratio * pol_pitch
-            yaw = controller_ratio * controller_yaw + policy_ratio * pol_yaw
-            thrust = controller_ratio * controller_thrust + policy_ratio * pol_thrust
+            roll, pitch, yaw, thrust = mix_ctbr_commands(
+                controller_command,
+                policy_command,
+                policy_ratio,
+            )
         else:
             # Legacy mode retained so previous probe/training results remain reproducible.
             roll = controller_roll_raw + limits.residual_gain * pol_roll
@@ -1258,7 +1303,7 @@ class FastIrisLineFollowVecEnv:
         vel_ned = enu_to_ned(state.linear_velocity)
         try:
             quat_ned_frd = state.get_attitude_ned_frd()
-            roll, pitch, yaw = Rotation.from_quat(quat_ned_frd).as_euler("XYZ", degrees=False)
+            roll, pitch, yaw = quaternion_ned_frd_to_euler(quat_ned_frd)
         except Exception:
             roll, pitch, yaw = 0.0, 0.0, 0.0
         try:
@@ -1301,8 +1346,8 @@ class FastIrisLineFollowVecEnv:
         except Exception:
             pass
         return Rotation.from_euler(
-            "XYZ",
-            [obs.roll, obs.pitch, obs.yaw],
+            "ZYX",
+            [obs.yaw, obs.pitch, obs.roll],
             degrees=False,
         ).as_quat()
 
@@ -1343,13 +1388,14 @@ class FastIrisLineFollowVecEnv:
             action_limits=self.config.action_limits,
             yaw_reference=self._policy_yaw_reference[env_id],
         )
-        if self.task_config.camera_tracking_enabled:
+        if self.camera_obs_dim:
             camera_projection = self._project_camera_target(env_id, obs)
             policy_obs = np.concatenate(
                 (
                     policy_obs,
-                    camera_projection.actor_features(
-                        self.task_config.camera_far_clip_m
+                    camera_observation_vector(
+                        camera_projection,
+                        self._camera_model_config,
                     ),
                 )
             ).astype(np.float32)
@@ -1379,24 +1425,12 @@ class FastIrisLineFollowVecEnv:
             ).astype(np.float32)
         else:
             future_reference = np.zeros((self.num_envs, 0), dtype=np.float32)
-        if self.task_config.camera_tracking_enabled:
-            # Preserve the exact legacy Critic column order so an 83-input
-            # checkpoint can be transplanted without semantic column shifts.
-            critic_obs = np.concatenate(
-                (
-                    actor_obs[:, : self.base_obs_dim],
-                    future_reference,
-                    privileged[:, : self.base_privileged_obs_dim],
-                    actor_obs[:, self.base_obs_dim :],
-                    privileged[:, self.base_privileged_obs_dim :],
-                ),
-                axis=1,
-            ).astype(np.float32)
-        else:
-            critic_obs = np.concatenate(
-                (actor_obs, future_reference, privileged),
-                axis=1,
-            ).astype(np.float32)
+        actor_base = actor_obs[:, : self.base_obs_dim]
+        camera_obs = actor_obs[:, self.base_obs_dim :]
+        critic_obs = np.concatenate(
+            (actor_base, future_reference, privileged, camera_obs),
+            axis=1,
+        ).astype(np.float32)
         if critic_obs.shape != (self.num_envs, self.critic_obs_dim):
             raise RuntimeError(
                 f"critic observation has shape {critic_obs.shape}, expected "
@@ -1467,27 +1501,6 @@ class FastIrisLineFollowVecEnv:
             control_ratio,
             local_tracking,
         ]
-        if self.task_config.camera_tracking_enabled:
-            max_lost_denominator = max(
-                1,
-                self.max_camera_lost_steps
-                if self.max_camera_lost_steps > 0
-                else self._camera_eligible_steps[env_id],
-            )
-            components.append(
-                np.array(
-                    [
-                        float(self._camera_success_met[env_id]),
-                        self._camera_good_fraction[env_id],
-                        self._camera_visible_fraction[env_id],
-                        float(self._camera_window_ready[env_id]),
-                        self._camera_local_good_fraction[env_id],
-                        self._camera_max_consecutive_lost_steps[env_id]
-                        / float(max_lost_denominator),
-                    ],
-                    dtype=np.float32,
-                )
-            )
         privileged = np.concatenate(
             (
                 *components,
@@ -2380,6 +2393,9 @@ class FastIrisLineFollowVecEnv:
             "yaw": float(obs.yaw),
             "yaw_rate": float(obs.yawspeed),
             "yaw_start": float(self._episode_start_yaw[env_id]),
+            "initial_camera_bearing_deg": float(
+                self._initial_camera_bearing_deg[env_id]
+            ),
             "yaw_target": yaw_target,
             "yaw_error": yaw_error,
             "max_abs_yaw_error": float(self._max_abs_yaw_error[env_id]),
@@ -2482,6 +2498,15 @@ class FastIrisLineFollowVecEnv:
             "cmd_yaw_saturated": bool(self._last_command_saturated[env_id, 2]),
             "cmd_thrust_saturated": bool(self._last_command_saturated[env_id, 3]),
             "cmd_any_saturated": bool(np.any(self._last_command_saturated[env_id])),
+            "helper_roll_rate_limited": bool(
+                self._last_helper_rate_limited[env_id, 0]
+            ),
+            "helper_pitch_rate_limited": bool(
+                self._last_helper_rate_limited[env_id, 1]
+            ),
+            "helper_any_rate_limited": bool(
+                np.any(self._last_helper_rate_limited[env_id])
+            ),
             "target_phase": phase,
             "primitive_id": str(self._primitive_id[env_id]),
             "primitive_code": int(self._primitive_code[env_id]),

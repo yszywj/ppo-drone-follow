@@ -32,41 +32,40 @@ No future trajectory point, primitive ID, phase ID or trajectory progress is an
 Actor input. In particular, a path sampled by the simulator cannot leak into
 the policy that will be deployed against an unknown real target.
 
-When forward-camera tracking is enabled, six causal image-space features are
-appended: normalized horizontal/vertical image coordinates, normalized forward
-depth/range, visibility and center quality. The Actor is therefore 38-dimensional
-for the camera curriculum. These values describe the actual moving target, not
-the following point one metre behind it. They can later be supplied by a visual
-target detector/tracker instead of simulator geometry.
+When the forward-view curriculum is enabled, six detector-style values are
+appended to both networks: normalized horizontal image position, normalized
+vertical image position, normalized optical-axis depth, normalized 3D range,
+visibility and center quality. An invisible target returns zero measurements
+and a zero visibility bit. These values model the output contract of an upstream
+vision model; raw images and simulator-only camera intent do not enter PPO.
 
-`actor_mask_target_acceleration=true` keeps the 32-value checkpoint contract
-but fills the three following-point acceleration slots with zero. This is the
+`actor_mask_target_acceleration=true` keeps the 32-value base checkpoint
+contract but fills the three following-point acceleration slots with zero. This is the
 default in the masked bridge and vertical curriculum configs. Vehicle
 acceleration remains available to the Actor; exact target/reference
 acceleration remains available only to the training-time privileged Critic and
 the temporary helper controller.
 
-The Actor is:
+The camera-enabled Actor is:
 
 ```text
-32 or 38 causal values -> 256-256-128 ELU frame encoder
+32 causal values + 6 camera values -> 256-256-128 ELU frame encoder
 frame embedding history -> GRU 128
 small gated recurrent residual -> tanh-squashed Gaussian CTBR action
 ```
 
-The frame encoder, GRU and action head keep their parameter names. The partial
-checkpoint loader copies all shared tensors and explicitly zero-initializes
-new input columns. A 32-input policy therefore produces exactly its old action
-before the new camera columns learn nonzero weights. Stage 8 restores training
-of the transferred GRU residual branch at a reduced recurrent learning rate.
+The frame encoder, GRU and action head keep their parameter names. Stage 8
+partially transplants the Stage 7 network, initializes the six new first-layer
+columns to zero, and restores training of the transferred GRU residual branch at
+a reduced recurrent learning rate.
 
-The asymmetric Critic is 83-dimensional without the camera: 32 Actor values,
-15 future following-point values at 0.2, 0.4, 0.8, 1.2 and 1.6 seconds, and 36
-privileged values. The camera curriculum appends six Actor camera values and
-six camera-quality privileged values, producing a 95-dimensional Critic. The
-legacy 83 columns retain their exact order during migration. Simulator-only
-phase, primitive ID, segment progress, remaining episode time, exact target
-dynamics and future trajectory never reach the Actor.
+The camera-enabled Actor is 38-dimensional. The asymmetric Critic is
+89-dimensional: the original 32 Actor values, 15 future following-point values
+at 0.2, 0.4, 0.8, 1.2 and 1.6 seconds, 36 privileged values, then the same six
+camera values. Appending camera values after the old 83 Critic columns preserves
+the transferred feature semantics. Simulator-only phase, primitive ID, segment
+progress, remaining episode time, exact target dynamics and future trajectory
+never reach the Actor.
 
 Recurrent PPO minibatches preserve complete time sequences and split by
 environment rather than randomly mixing individual transitions. Actor and
@@ -215,6 +214,11 @@ defines the success FOV. Center quality is a continuous two-dimensional Gaussian
 in `(u, v)`, so centering receives more reward than merely touching the image
 edge. Out-of-view samples receive a penalty.
 
+The six network inputs use `(u, v)` directly in normalized image coordinates;
+depth is normalized between the near and far planes and range by the far plane.
+Visibility masks the four measurements when an upstream detector has no target,
+while center quality remains a bounded `[0, 1]` confidence-like feature.
+
 Camera success is percentage based, like moving tracking success: at least
 `camera_success_min_fraction` of all task samples must lie inside the success
 FOV. Final stopped dwell additionally requires the target to be inside the FOV
@@ -222,13 +226,21 @@ at the current step. The same camera condition is joined with the causal 2-secon
 tracking window; a local tracking completion reward is withheld when the recent
 camera fraction is below `camera_local_success_min_fraction`.
 
-When camera tracking is active, the task-level yaw-hold helper is disabled and
-PPO must command CTBR yaw to keep the target visible. The permanent body-rate
-loop remains active. This geometry models rigid mounting, full 3D vehicle
-attitude, FOV and clipping, but it does not yet model occlusion, lens distortion,
-detector latency/dropout or image-estimation noise. Those effects should be
-domain-randomized before replacing the geometric observation with a real vision
-pipeline.
+When the forward-view objective is active, the temporary yaw helper uses the
+actual target point's horizontal camera bearing:
+
+```text
+yaw_rate_helper = clip(kp * bearing - kd * body_yaw_rate, +/- max_rate)
+```
+
+A small center deadband prevents chatter. Targets outside or behind the view are
+turned toward through the shortest wrapped bearing. The command is mixed with
+PPO by the same global controller/PPO ratio as roll, pitch and thrust, so pure
+helper control can center the target and the helper disappears with the rest of
+the task controller as `policy_ratio` approaches one. The permanent body-rate
+loop remains active. This geometry models rigid mounting, full 3D attitude, FOV
+and clipping, but not real pixels, occlusion, lens distortion, detector latency
+or visual noise.
 
 ## JSON training configs
 
@@ -297,20 +309,37 @@ Available curriculum configs:
   normalized units, freezes the transferred GRU branch, and limits cumulative
   Actor drift with a fixed-reference KL term.
 - `stage8_camera_short_high_amplitude_5hz_ratio_5to5_100k_seed8.json`: transfers
-  the Stage 7 best checkpoint, restores GRU training, unifies moving/stopped XY
-  and Z tolerances at 0.3 m, and adds the forward-camera objective. Each episode
-  has an initial acceleration plus two to four sampled segments (three to five
-  total), with at least one turn of 35 degrees or more and one straight climb or
-  descent of 0.6 m or more.
+  the Stage 7 best checkpoint into the 38/89 camera observation contracts,
+  restores GRU training, unifies moving/stopped XY and Z tolerances at 0.3 m,
+  and adds the point-target forward-view objective plus target-centering yaw
+  helper. Each episode has an initial acceleration plus two to four sampled
+  segments (three to five total), with at least one turn of 35 degrees or more
+  and one straight climb or descent of 0.6 m or more.
+- `stage8_camera_short_high_amplitude_5hz_ratio_5to5_500k_seed8.json`: the
+  corresponding 500k Stage 8 training run after the full-helper qualification.
+- `stage9_global_yaw_visible_bridge_5hz_ratio_8to2_100k_seed9.json`: simplifies
+  the camera curriculum to an initial acceleration and one or two sampled
+  segments, aligns initial vehicle yaw with a visible target, and restarts the
+  handoff at an 8:2 helper/PPO ratio over globally random path headings.
+- `stage10_global_yaw_visible_bridge_5hz_ratio_7to3_64k_seed10.json`: preserves
+  the successful Stage 9 policy and optimizer while testing four updates at a
+  strict 7:3 helper/PPO ratio on the unchanged task.
+- `stage11_global_yaw_visible_bridge_5hz_ratio_6to4_64k_seed11.json`: continues
+  from Stage 10 update 4 for the corresponding four-update 6:4 handoff test.
+- `eval_stage8_full_helper_short.json`: deterministic controller-only Stage 8
+  qualification with zero PPO contribution. It runs one complete 320-step
+  horizon in each of 64 independent environments under the unchanged strict
+  success gates.
+- `eval_stage8_full_helper_v2_short.json`: paired seed-80 rerun after correcting
+  NED-FRD attitude extraction to aerospace ZYX and increasing helper XY damping.
 - `eval_fixed_seed5_best_50k.json`: deterministic no-update evaluation with a
   fixed per-environment task bank. `ablation/run_fixed_ablation.sh` compares the
   retained GRU, disabled GRU, wider CTBR roll/pitch limits and helper-only control.
 
 Stage 7 sets `allow_partial_checkpoint=true` because six causal local-window
-statistics were added to the privileged Critic input. Stage 8 also uses partial
-loading because its camera observations expand Actor and Critic inputs; every
-new input column starts at zero so the transferred policy remains initially
-unchanged.
+statistics were added to the privileged Critic input. Stage 8 also requires
+partial loading for the six new Actor and Critic camera columns; appended input
+weights start at zero so the transferred policy is initially unchanged.
 
 New checkpoints include Actor and Critic optimizer states, PopArt state when
 enabled, the fixed reference-policy anchor when used, plus Python, NumPy, Torch
@@ -330,7 +359,10 @@ visibility. Timeout and other failure rates are penalties. A candidate is not
 eligible until the rolling window contains `best_checkpoint_min_episodes`, and
 critical overall-success, stopped-XY, final-stop, final-XY and camera metrics
 cannot drop beyond `best_checkpoint_guardrail_drop`. Optional early stopping
-uses this same guarded score rather than moving quality alone.
+uses this same guarded score rather than moving quality alone. Moving, stopped,
+final-stop and camera fractions are weighted by their underlying sample counts,
+not equally by update. The best file is written from the frozen policy state
+that generated the scored rollout, before the corresponding PPO update.
 
 ## Results
 
@@ -348,7 +380,8 @@ and the timestamp distinguishes repeated runs. Each run stores:
 Update metrics include the raw/effective GRU gate, separate backbone/recurrent
 learning rates, raw return/value statistics, value clipping, reference KL,
 per-axis policy/helper/final CTBR commands and saturation, local-window quality,
-and moving/stopped XY, Z, velocity and joint good fractions.
+helper-internal roll/pitch rate limiting, and moving/stopped XY, Z, velocity and
+joint good fractions.
 Vertical-task rows additionally contain height/vertical-velocity good
 fractions, vertical gate state and per-primitive vertical velocity error.
 Those conditions are also split by primitive in
@@ -360,6 +393,14 @@ visibility fraction and maximum lost-target streak. `checkpoint_and_outcomes.png
 shows overall success, timeout, stopped conditions and final XY error;
 `camera_tracking.png` and the camera panel in
 `episode_condition_fractions.png` expose view-centering failures directly.
+When camera tracking is enabled, `episode_outcomes.png` also adds per-episode
+visibility and camera success-region fractions beside the other success gates.
+Plots for an existing run can be regenerated without restarting Isaac Sim:
+
+```bash
+./python.sh /home/1234/workspace/runpy/pegasus_iris_fast_line_follow/replot_pegasus_iris_fast_line_follow.py \
+  --run_dir /home/1234/workspace/runpy/pegasus_iris_fast_line_follow/result/ppo_train/seedN_TIMESTAMP
+```
 
 ## Host-side tests
 

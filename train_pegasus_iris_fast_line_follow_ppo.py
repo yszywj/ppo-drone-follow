@@ -117,6 +117,16 @@ def parse_args():
     parser.add_argument("--allow_partial_checkpoint", action="store_true", default=False)
     parser.add_argument("--reset_optimizer", action="store_true", default=False)
     parser.add_argument(
+        "--reset_actor_output_on_load",
+        action="store_true",
+        default=False,
+        help=(
+            "Reinitialize the four-dimensional Actor mean head and action "
+            "standard deviation after loading a checkpoint; Actor features, "
+            "GRU, Critic, and PopArt state are retained."
+        ),
+    )
+    parser.add_argument(
         "--reset_rng_on_load",
         action="store_true",
         default=False,
@@ -232,6 +242,25 @@ def parse_args():
     parser.add_argument("--randomize_line_yaw", action="store_true", default=False)
     parser.add_argument("--line_yaw_min_deg", type=float, default=-20.0)
     parser.add_argument("--line_yaw_max_deg", type=float, default=20.0)
+    parser.add_argument(
+        "--align_initial_yaw_to_line",
+        action="store_true",
+        default=False,
+        help=(
+            "Correlate vehicle start yaw with the sampled world trajectory "
+            "direction so the target begins at a sampled camera bearing."
+        ),
+    )
+    parser.add_argument(
+        "--initial_camera_bearing_min_deg",
+        type=float,
+        default=-40.0,
+    )
+    parser.add_argument(
+        "--initial_camera_bearing_max_deg",
+        type=float,
+        default=40.0,
+    )
 
     parser.add_argument("--tracking_xy_tolerance_m", type=float, default=0.30)
     parser.add_argument("--tracking_z_tolerance_m", type=float, default=0.30)
@@ -310,6 +339,14 @@ def parse_args():
     parser.add_argument("--reward_camera_visible_scale", type=float, default=0.0)
     parser.add_argument("--reward_camera_lost_scale", type=float, default=0.0)
     parser.add_argument("--reward_camera_local_scale", type=float, default=0.0)
+    parser.add_argument("--camera_yaw_helper_kp", type=float, default=1.0)
+    parser.add_argument("--camera_yaw_helper_kd", type=float, default=0.15)
+    parser.add_argument(
+        "--camera_yaw_helper_max_rate_rad_s", type=float, default=0.60
+    )
+    parser.add_argument(
+        "--camera_yaw_helper_deadband_deg", type=float, default=2.0
+    )
     parser.add_argument("--max_tracking_error_m", type=float, default=3.0)
     parser.add_argument("--min_target_distance_m", type=float, default=0.35)
 
@@ -445,6 +482,10 @@ def parse_args():
         "reward_camera_visible_scale",
         "reward_camera_lost_scale",
         "reward_camera_local_scale",
+        "camera_yaw_helper_kp",
+        "camera_yaw_helper_kd",
+        "camera_yaw_helper_max_rate_rad_s",
+        "camera_yaw_helper_deadband_deg",
         "reward_stop_speed_scale",
         "reward_braking_scale",
         "reward_stop_overspeed_scale",
@@ -523,8 +564,30 @@ def parse_args():
         parser.error("camera window and reward interval must be positive")
     if args.camera_center_sigma_u <= 0.0 or args.camera_center_sigma_v <= 0.0:
         parser.error("camera center sigmas must be positive")
+    if args.camera_yaw_helper_deadband_deg > 180.0:
+        parser.error("--camera_yaw_helper_deadband_deg must be <= 180")
     if args.line_length_min_m > args.line_length_max_m:
         parser.error("--line_length_min_m must be <= --line_length_max_m")
+    if args.initial_camera_bearing_min_deg > args.initial_camera_bearing_max_deg:
+        parser.error(
+            "--initial_camera_bearing_min_deg must be <= "
+            "--initial_camera_bearing_max_deg"
+        )
+    if max(
+        abs(args.initial_camera_bearing_min_deg),
+        abs(args.initial_camera_bearing_max_deg),
+    ) > 180.0:
+        parser.error("initial camera bearing bounds must lie in [-180, 180]")
+    if args.align_initial_yaw_to_line and args.randomize_yaw:
+        parser.error(
+            "--align_initial_yaw_to_line and --randomize_yaw are mutually exclusive"
+        )
+    if args.reset_actor_output_on_load and (
+        args.from_scratch or not args.load_checkpoint
+    ):
+        parser.error(
+            "--reset_actor_output_on_load requires a loaded checkpoint"
+        )
     if args.reward_stopped_time_penalty > 0.0:
         parser.error("--reward_stopped_time_penalty must be non-positive")
     if args.reward_timeout > 0.0:
@@ -564,11 +627,13 @@ def main():
         ActorCritic,
         PopArtValueNormalizer,
         append_csv_row,
+        capture_policy_checkpoint,
         compute_gae_vec,
         dump_json,
         explained_variance,
         load_transplanted_checkpoint,
         restore_training_state,
+        save_checkpoint_payload,
         save_policy_checkpoint,
         save_training_plots,
         start_tensorboard_writer,
@@ -708,6 +773,9 @@ def main():
         randomize_line_yaw=args.randomize_line_yaw,
         line_yaw_min_deg=args.line_yaw_min_deg,
         line_yaw_max_deg=args.line_yaw_max_deg,
+        align_initial_yaw_to_line=args.align_initial_yaw_to_line,
+        initial_camera_bearing_min_deg=args.initial_camera_bearing_min_deg,
+        initial_camera_bearing_max_deg=args.initial_camera_bearing_max_deg,
         tracking_xy_tolerance_m=args.tracking_xy_tolerance_m,
         tracking_z_tolerance_m=args.tracking_z_tolerance_m,
         tracking_velocity_tolerance_mps=args.tracking_velocity_tolerance_mps,
@@ -777,6 +845,14 @@ def main():
         reward_camera_visible_scale=args.reward_camera_visible_scale,
         reward_camera_lost_scale=args.reward_camera_lost_scale,
         reward_camera_local_scale=args.reward_camera_local_scale,
+        camera_yaw_helper_kp=args.camera_yaw_helper_kp,
+        camera_yaw_helper_kd=args.camera_yaw_helper_kd,
+        camera_yaw_helper_max_rate_rad_s=(
+            args.camera_yaw_helper_max_rate_rad_s
+        ),
+        camera_yaw_helper_deadband_deg=(
+            args.camera_yaw_helper_deadband_deg
+        ),
         max_tracking_error_m=args.max_tracking_error_m,
         min_target_distance_m=args.min_target_distance_m,
         reward_position_scale=args.reward_position_scale,
@@ -851,6 +927,7 @@ def main():
         "mean_completed_final_xy_err",
         "final_xy_quality",
         "final_stop_good_fraction",
+        "final_stop_sample_count",
         "checkpoint_score",
         "checkpoint_window_completed_episodes",
         "checkpoint_guardrail_violated",
@@ -898,6 +975,9 @@ def main():
         "cmd_pitch_saturation_fraction",
         "cmd_yaw_saturation_fraction",
         "cmd_thrust_saturation_fraction",
+        "helper_any_rate_limit_fraction",
+        "helper_roll_rate_limit_fraction",
+        "helper_pitch_rate_limit_fraction",
         "mean_abs_policy_cmd_roll_rate",
         "mean_abs_policy_cmd_pitch_rate",
         "mean_abs_policy_cmd_yaw_rate",
@@ -917,6 +997,7 @@ def main():
         "mean_capture_dwell_fraction",
         "moving_success_met_fraction",
         "mean_moving_good_fraction",
+        "moving_eligible_sample_count",
         "moving_xy_good_sample_fraction",
         "moving_z_good_sample_fraction",
         "moving_velocity_good_sample_fraction",
@@ -930,6 +1011,7 @@ def main():
         "mean_local_tracking_xy_drift_delta_m",
         "camera_visible_sample_fraction",
         "camera_good_sample_fraction",
+        "camera_sample_count",
         "mean_camera_center_quality",
         "mean_abs_camera_bearing_rad",
         "mean_abs_camera_elevation_rad",
@@ -956,6 +1038,7 @@ def main():
         "mean_desired_approach_speed",
         "mean_allowed_stopped_speed",
         "mean_stopped_velocity_error",
+        "stopped_sample_count",
         "stopped_xy_zone_fraction",
         "stopped_z_zone_fraction",
         "stopped_position_zone_fraction",
@@ -988,6 +1071,7 @@ def main():
         "final_yaw",
         "final_yaw_rate",
         "yaw_start",
+        "initial_camera_bearing_deg",
         "final_camera_visible",
         "final_camera_good",
         "final_camera_normalized_u",
@@ -1146,7 +1230,11 @@ def main():
                 f"success_margin={args.camera_success_margin:.2f}, "
                 f"episode_fraction>={args.camera_success_min_fraction:.2f}, "
                 f"local_fraction>={args.camera_local_success_min_fraction:.2f}; "
-                "task yaw helper disabled",
+                "detector-style camera features feed Actor/Critic; "
+                f"yaw_helper=kp{args.camera_yaw_helper_kp:.2f},"
+                f"kd{args.camera_yaw_helper_kd:.2f},"
+                f"max{args.camera_yaw_helper_max_rate_rad_s:.2f}rad/s,"
+                f"deadband{args.camera_yaw_helper_deadband_deg:.1f}deg",
                 flush=True,
             )
         print(f"[FAST PPO] initializing ActorCritic on {device}...", flush=True)
@@ -1180,6 +1268,13 @@ def main():
                 device,
                 allow_partial=args.allow_partial_checkpoint,
             )
+            if args.reset_actor_output_on_load:
+                policy.reset_actor_output(args.init_action_std)
+                print(
+                    "[FAST PPO] reset Actor CTBR output head and action std "
+                    f"to {args.init_action_std:.4f}; retained Actor features/GRU "
+                    "and Critic"
+                )
             if args.reset_temporal_gate_on_load:
                 with torch.no_grad():
                     policy.temporal_gate.fill_(args.temporal_gate_init)
@@ -1278,8 +1373,23 @@ def main():
                 "reference_policy_state_dict"
             )
             if reference_state is not None:
-                reference_policy.load_state_dict(reference_state)
-                print("[FAST PPO] restored fixed reference-policy anchor")
+                current_reference_state = reference_policy.state_dict()
+                reference_state_compatible = (
+                    set(reference_state) == set(current_reference_state)
+                    and all(
+                        tuple(reference_state[key].shape)
+                        == tuple(current_reference_state[key].shape)
+                        for key in current_reference_state
+                    )
+                )
+                if reference_state_compatible:
+                    reference_policy.load_state_dict(reference_state)
+                    print("[FAST PPO] restored fixed reference-policy anchor")
+                else:
+                    print(
+                        "[FAST PPO] checkpoint reference-policy shape changed; "
+                        "anchoring KL to the transplanted policy used at this run's start"
+                    )
             reference_policy.eval()
             for parameter in reference_policy.parameters():
                 parameter.requires_grad_(False)
@@ -1301,9 +1411,11 @@ def main():
             f"sim_steps/policy_step: {env._sim_steps_per_policy_step}"
         )
         print(
-            f"actor_obs_dim: {env.obs_dim} (causal current state only), "
+            f"actor_obs_dim: {env.obs_dim} "
+            f"(base={env.base_obs_dim}, camera={env.camera_obs_dim}), "
             f"critic_obs_dim: {env.critic_obs_dim} "
-            f"(future_ref={env.future_reference_dim} privileged), "
+            f"(base_actor={env.base_obs_dim}, future_ref={env.future_reference_dim}, "
+            f"privileged={env.privileged_obs_dim}, camera={env.camera_obs_dim}), "
             f"action_dim: {env.action_dim}, "
             f"actor={args.actor_hidden_sizes}, critic={args.critic_hidden_sizes}, "
             f"gru={args.recurrent_hidden_size}, recurrent_mode={args.actor_recurrent_mode}, "
@@ -1314,7 +1426,8 @@ def main():
         print(
             "policy_observation: vehicle position/velocity/acceleration/attitude/body rates, "
             "desired follow point, target position, follow-reference velocity/acceleration, "
-            "and previous CTBR command; future follow points and phase/task ids are critic-only"
+            "previous CTBR command, and detector-style image position/depth/visibility when enabled; "
+            "future follow points and phase/task ids are critic-only"
         )
         print(
             "actor_learning_rates: "
@@ -1362,6 +1475,15 @@ def main():
             f"episode_length={args.episode_length} steps "
             f"({args.episode_length * args.step_dt_sim_sec:.1f}s)"
         )
+        if args.align_initial_yaw_to_line:
+            print(
+                "initial_heading_sampling: "
+                f"world_line=[{args.line_yaw_min_deg:.1f}, "
+                f"{args.line_yaw_max_deg:.1f}]deg, "
+                "vehicle_yaw=line_yaw-camera_bearing, "
+                f"camera_bearing=[{args.initial_camera_bearing_min_deg:.1f}, "
+                f"{args.initial_camera_bearing_max_deg:.1f}]deg"
+            )
         if args.control_mix_mode == "ratio":
             print(
                 "control_mix: ratio "
@@ -1530,6 +1652,9 @@ def main():
             stats_completed_final_xy = []
             stats_cmd_saturation = {
                 key: [] for key in ("any", "roll", "pitch", "yaw", "thrust")
+            }
+            stats_helper_rate_limit = {
+                key: [] for key in ("any", "roll", "pitch")
             }
             stats_abs_commands = {
                 key: []
@@ -1763,6 +1888,12 @@ def main():
                             if info.get(f"cmd_{axis}_saturated", False)
                             else 0.0
                         )
+                    for axis in ("any", "roll", "pitch"):
+                        stats_helper_rate_limit[axis].append(
+                            1.0
+                            if info.get(f"helper_{axis}_rate_limited", False)
+                            else 0.0
+                        )
                     stats_abs_commands["policy_roll"].append(
                         abs(float(info.get("policy_cmd_roll_rate", 0.0)))
                     )
@@ -1931,6 +2062,9 @@ def main():
                             "final_yaw": float(info.get("yaw", 0.0)),
                             "final_yaw_rate": float(info.get("yaw_rate", 0.0)),
                             "yaw_start": float(info.get("yaw_start", 0.0)),
+                            "initial_camera_bearing_deg": float(
+                                info.get("initial_camera_bearing_deg", 0.0)
+                            ),
                             "final_camera_visible": bool(
                                 info.get("camera_visible", False)
                             ),
@@ -2208,6 +2342,25 @@ def main():
                 if value_normalizer is not None:
                     last_values_t = value_normalizer.denormalize(last_values_t)
                 last_values = last_values_t.detach().cpu().numpy()
+            evaluated_checkpoint_payload = None
+            if (
+                args.best_checkpoint_window > 0
+                and len(update_rows) + 1 >= args.best_checkpoint_window
+                and not args.evaluation_only
+            ):
+                evaluated_checkpoint_payload = capture_policy_checkpoint(
+                    policy,
+                    update,
+                    total_steps,
+                    actor_optimizer,
+                    critic_optimizer,
+                    env._rng,
+                    value_normalizer,
+                    reference_policy,
+                )
+                evaluated_checkpoint_payload["evaluated_rollout_update"] = int(
+                    update + 1
+                )
             rewards_np = np.asarray(reward_buf, dtype=np.float32)
             dones_np = np.asarray(done_buf, dtype=bool)
             values_np = np.asarray(value_buf, dtype=np.float32)
@@ -2524,6 +2677,9 @@ def main():
                 ),
                 "final_xy_quality": float(final_xy_quality),
                 "final_stop_good_fraction": float(final_stop_good_fraction),
+                "final_stop_sample_count": int(
+                    len(stats_primitive_good["final_stop"])
+                ),
                 "done_reasons": json.dumps(dict(stats_reasons), sort_keys=True),
                 "primitive_sample_counts": json.dumps(
                     dict(stats_primitives),
@@ -2656,6 +2812,15 @@ def main():
                 "cmd_thrust_saturation_fraction": float(
                     np.mean(stats_cmd_saturation["thrust"])
                 ),
+                "helper_any_rate_limit_fraction": float(
+                    np.mean(stats_helper_rate_limit["any"])
+                ),
+                "helper_roll_rate_limit_fraction": float(
+                    np.mean(stats_helper_rate_limit["roll"])
+                ),
+                "helper_pitch_rate_limit_fraction": float(
+                    np.mean(stats_helper_rate_limit["pitch"])
+                ),
                 "mean_abs_policy_cmd_roll_rate": float(
                     np.mean(stats_abs_commands["policy_roll"])
                 ),
@@ -2708,6 +2873,9 @@ def main():
                     float(np.mean(stats_moving_good_fraction))
                     if stats_moving_good_fraction
                     else 0.0
+                ),
+                "moving_eligible_sample_count": int(
+                    len(stats_moving_good_sample)
                 ),
                 "moving_xy_good_sample_fraction": (
                     float(np.mean(stats_moving_xy_good_sample))
@@ -2772,6 +2940,7 @@ def main():
                     if stats_camera_good_sample
                     else 0.0
                 ),
+                "camera_sample_count": int(len(stats_camera_good_sample)),
                 "mean_camera_center_quality": (
                     float(np.mean(stats_camera_center_quality))
                     if stats_camera_center_quality
@@ -2876,6 +3045,7 @@ def main():
                     if stats_stopped_velocity_error
                     else 0.0
                 ),
+                "stopped_sample_count": int(len(stats_stopped_xy_met)),
                 "stopped_xy_zone_fraction": (
                     float(np.mean(stats_stopped_xy_met)) if stats_stopped_xy_met else 0.0
                 ),
@@ -2987,21 +3157,22 @@ def main():
             append_csv_row(metrics_dir / "update_metrics.csv", update_fields, update_row)
             write_tensorboard_scalars(writer, update_row, total_steps)
             if best_checkpoint_saved and not args.evaluation_only:
-                save_policy_checkpoint(
+                if evaluated_checkpoint_payload is None:
+                    raise RuntimeError(
+                        "missing evaluated-policy snapshot for best checkpoint"
+                    )
+                save_checkpoint_payload(
                     model_dir / "actor_critic_best.pt",
-                    policy,
-                    update,
-                    total_steps,
-                    actor_optimizer,
-                    critic_optimizer,
-                    env._rng,
-                    value_normalizer,
-                    reference_policy,
+                    evaluated_checkpoint_payload,
                 )
                 dump_json(
                     model_dir / "actor_critic_best.json",
                     {
                         "update": int(update),
+                        "policy_update": int(
+                            evaluated_checkpoint_payload.get("update", update - 1)
+                        ),
+                        "evaluated_rollout_update": int(update),
                         "total_steps": int(total_steps),
                         "window": int(args.best_checkpoint_window),
                         "minimum_completed_episodes": int(
@@ -3142,6 +3313,7 @@ def main():
             print(
                 f"  control: action_abs_mean={update_row['action_abs_mean']:.3f}, "
                 f"saturation={update_row['cmd_saturation_fraction']:.3f}, "
+                f"helper_rate_limit={update_row['helper_any_rate_limit_fraction']:.3f}, "
                 f"roll(policy/helper/final)="
                 f"{update_row['mean_abs_policy_cmd_roll_rate']:.4f}/"
                 f"{update_row['mean_abs_controller_cmd_roll_rate']:.4f}/"
