@@ -171,6 +171,33 @@ class TrainingConfigTest(unittest.TestCase):
         self.assertIn("seed10_20260720_120604", args.load_checkpoint)
         self.assertIn("actor_critic_update_4.pt", args.load_checkpoint)
 
+    def test_stage12_uses_latest_validated_policy_for_5_to_5_handoff(self) -> None:
+        args = self._parse(
+            "stage12_global_yaw_visible_bridge_5hz_ratio_5to5_64k_seed12.json"
+        )
+        self.assertEqual(args.seed, 12)
+        self.assertEqual(args.num_env_steps, 65536)
+        self.assertAlmostEqual(args.policy_ratio, 0.5)
+        self.assertFalse(args.reset_optimizer)
+        self.assertFalse(args.reset_actor_output_on_load)
+        self.assertIn("seed11_20260720_151207", args.load_checkpoint)
+        self.assertIn("actor_critic_update_3.pt", args.load_checkpoint)
+
+    def test_stage13_runs_long_5_to_5_recovery_from_seed12_best(self) -> None:
+        args = self._parse(
+            "stage13_global_yaw_visible_bridge_5hz_ratio_5to5_800k_seed13.json"
+        )
+        self.assertEqual(args.seed, 13)
+        self.assertEqual(args.num_env_steps, 800000)
+        self.assertEqual(args.rollout_steps, 128)
+        self.assertAlmostEqual(args.policy_ratio, 0.5)
+        self.assertFalse(args.reset_optimizer)
+        self.assertFalse(args.reset_actor_output_on_load)
+        self.assertEqual(args.early_stop_patience_updates, 8)
+        self.assertAlmostEqual(args.early_stop_drop_threshold, 0.05)
+        self.assertIn("seed12_20260720_164811", args.load_checkpoint)
+        self.assertIn("actor_critic_best.pt", args.load_checkpoint)
+
     def test_full_helper_short_evaluation_has_zero_policy_mix(self) -> None:
         args = self._parse("eval_stage8_full_helper_short.json")
         self.assertTrue(args.evaluation_only)

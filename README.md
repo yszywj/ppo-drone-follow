@@ -326,6 +326,14 @@ Available curriculum configs:
   strict 7:3 helper/PPO ratio on the unchanged task.
 - `stage11_global_yaw_visible_bridge_5hz_ratio_6to4_64k_seed11.json`: continues
   from Stage 10 update 4 for the corresponding four-update 6:4 handoff test.
+- `stage12_global_yaw_visible_bridge_5hz_ratio_5to5_64k_seed12.json`: continues
+  from the latest seed-11 policy already validated by a complete rollout and
+  tests the unchanged task for four updates at a 5:5 helper/PPO ratio.
+- `stage13_global_yaw_visible_bridge_5hz_ratio_5to5_800k_seed13.json`: resumes
+  from the seed-12 best checkpoint for a long 5:5 recovery run and stops early
+  after eight consecutive updates with a checkpoint-score drop of at least
+  0.05. Its 128-step recurrent rollout covers roughly one current episode and
+  doubles update frequency relative to Stages 7-12.
 - `eval_stage8_full_helper_short.json`: deterministic controller-only Stage 8
   qualification with zero PPO contribution. It runs one complete 320-step
   horizon in each of 64 independent environments under the unchanged strict
